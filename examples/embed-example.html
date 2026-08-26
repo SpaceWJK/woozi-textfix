@@ -25,12 +25,14 @@
 
   <ul>
     <li>Click the pencil icon in the top-right corner.</li>
-    <li>Enter the demo password: <code>demo</code> (this page's <code>pwHashHex</code> below is
-      the SHA-256 hash of that word — replace it with your own before using this for real; see the
-      README's Quick Start for how to compute it).</li>
+    <li>Enter the demo password: <code>demo</code> — it decrypts the dummy token embedded below
+      (AES-GCM). The password is verified by that decryption succeeding; there is no separate
+      password hash on the page.</li>
     <li>Edit any paragraph, heading, or list item on this page.</li>
-    <li>Press Save. With no GitLab token configured (as below), this will show a failure toast —
-      that's expected. Nothing is lost; the edit stays on the page and in the localStorage draft.</li>
+    <li>Press Save. The embedded token is a harmless dummy and the host is the placeholder
+      <code>gitlab.example.com</code>, so the commit will fail with a friendly toast — that's
+      expected for this demo. Nothing is lost; the edit stays on the page and in the localStorage
+      draft. Swap in a real host/token (see the README's Quick Start) to enable commit-save.</li>
   </ul>
 
   <div class="callout">
@@ -41,22 +43,20 @@
   <!-- wz-editor:start -->
   <script>
     window.WZ_EDITOR_CONFIG = {
-      // Replace with your own GitLab host, or leave the placeholder if you only want the
-      // editing/formatting/draft features without commit-save.
+      // provider: 'gitlab' (default) or 'github'. Replace host/path with your own for real use.
+      provider: 'gitlab',
       gitlabHost: 'https://gitlab.example.com',
       projectPath: 'your-group/your-repo',
       filePath: 'examples/embed-example.html',
       branch: 'main',
-      // SHA-256 hex hash of the word "demo" — this example's password. Computed with
-      // e.g. `node -e "console.log(require('crypto').createHash('sha256').update('demo').digest('hex'))"`
-      // or in a browser console via crypto.subtle.digest('SHA-256', ...). Replace with your own
-      // password's hash before using this outside of this demo.
-      pwHashHex: '2a97516c354b68848cdbd8f54a226a0a55b21ed138e207ad6c5cbb9c00aa5aea',
-      // Leave these three empty to disable GitLab commit-save (editing/formatting/draft still
-      // work; Save will show a friendly failure toast instead of committing anywhere).
-      tokenSaltB64: '',
-      tokenIvB64: '',
-      tokenCipherB64: '',
+      // The three values below are a DUMMY token ("demo-token-not-a-real-credential")
+      // encrypted with the password "demo" (PBKDF2 600k -> AES-256-GCM), produced by
+      // `tools/encrypt-token.mjs`. Authentication happens by decrypting this successfully —
+      // there is no separate password hash. Replace these with your own encrypted token
+      // (see the README's Quick Start) before using this for real.
+      tokenSaltB64: '8yEPrNHYeZ5SAVzZaiKSVg==',
+      tokenIvB64: '5kvOgDPkiFgWhAZB',
+      tokenCipherB64: '7Pvx+5LyYNFuwPnpFyLAJ78Xezlce9GQzdGKkNXGLwV/HXbZzr6q2LrpgXM2Pwvk',
       editableSelector: null
     };
   </script>

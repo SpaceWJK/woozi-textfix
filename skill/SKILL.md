@@ -1,6 +1,8 @@
 ---
 name: textfix
-description: 정적 HTML 문서(로컬 경로 또는 GitLab Pages URL)에 인페이지 편집 기능(wz-editor — 비밀번호 게이트 + 전역 contenteditable + 리치텍스트 툴바 + localStorage 초안 + GitLab 커밋 저장)을 부착/탈착한다. 트리거: "HTML에 편집 기능 붙여줘", "문서 직접 편집 가능하게", "textfix", "인페이지 편집 추가", "편집 버튼 달아줘", URL 또는 경로 제시 + "편집 기능/편집 가능하게" 조합. 탈착은 "/textfix --detach <경로>" 또는 "편집 기능 떼줘/제거해줘".
+description: "HTML로 만든 문서에 간단한 인페이지 '편집툴'을 붙여주는 스킬 — 붙이면 브라우저에서 연필 아이콘을 눌러 비밀번호를 입력하고 그 자리에서 텍스트를 직접 고쳐 GitLab 또는 GitHub 커밋으로 저장할 수 있다. 사용법: '/textfix' 실행 후 편집 기능을 붙일 HTML 문서의 로컬 경로나 GitLab/GitHub URL을 알려주면 된다. 탈착은 '/textfix --detach <경로>'. 트리거: 'HTML에 편집 기능 붙여줘', '문서 직접 편집 가능하게', '편집 버튼 달아줘', 'textfix', '인페이지 편집 추가', 경로/URL 제시 + '편집 기능/편집 가능하게' 조합, 탈착은 '편집 기능 떼줘/제거해줘'."
+user_invocable: true
+auto_trigger: true
 version: 0.1.0
 ---
 
@@ -36,6 +38,24 @@ version: 0.1.0
   기존 블록을 찾으면 "이미 부착되어 있습니다 — 갱신하시겠습니까?"로 갱신
   여부를 묻는다.
 
+## Step 0. 스킬 소개 및 입력 안내 (호출 직후)
+
+사용자가 대상 없이 `/textfix`만 호출했으면, 먼저 이 스킬이 무엇인지 한 줄로
+소개하고 입력을 요청한다(대상 경로/URL이 이미 인자로 주어졌으면 이 안내를
+생략하고 Step 1로 진행):
+
+> **textfix** 는 이미 만들어진 HTML 문서에 **인페이지 '편집툴'** 을 붙여주는
+> 스킬입니다. 붙이고 나면 브라우저에서 우측 상단 **연필 아이콘 → 비밀번호 →
+> 텍스트를 그 자리에서 직접 수정 → 저장**(GitLab/GitHub 커밋)까지 됩니다. 별도
+> CMS나 개발환경 없이 이미 배포된 정적 문서에 편집 기능만 얇게 얹는 용도입니다.
+>
+> 편집 기능을 붙일 **HTML 문서의 경로**(GitLab/GitHub 저장소에 clone된 로컬
+> 경로) 또는 **GitLab/GitHub Pages URL** 을 알려주세요.
+>
+> ⚠️ 이 스킬은 **GitLab/GitHub 저장소에 있는 HTML 문서 전용**입니다. 저장이
+> 커밋으로 이뤄지기 때문에, git 저장소에 속하지 않은 순수 로컬 문서는
+> 지원하지 않습니다(브라우저 보안상 로컬 파일 직접 저장 불가).
+
 ## Step 1. 대상 판별
 
 인자로 받은 문자열이 URL인지 로컬 경로인지 먼저 구분한다.
@@ -49,59 +69,67 @@ version: 0.1.0
   속하는지 `git rev-parse --show-toplevel`로 확인한다(대상 파일이 있는
   디렉터리에서 실행). 성공하면 레포 루트 경로를 얻는다.
 
-## Step 2. 모드 분기
+**전제 (필수)**: 대상 문서는 반드시 **GitLab/GitHub 저장소에 속해야** 한다.
+`git remote`(인자 없이)로 remote가 없거나 git 레포가 아니면, 아래처럼 고지하고
+**중단**한다 — 저장 백엔드가 없어 이 스킬을 붙일 수 없다:
 
-### 2-A. 레포 소속 (git 레포 안, remote 존재)
+> "이 문서는 GitLab/GitHub 저장소에 속해 있지 않습니다. textfix는 편집 결과를
+> 저장소 커밋으로 저장하므로, git 저장소 안의 문서에만 부착할 수 있습니다.
+> (브라우저 보안상 순수 로컬 파일은 직접 저장이 불가능합니다.)"
 
-`git remote`(인자 없이, 이름만)로 remote가 존재하는지 확인한다. 존재하면
-**풀 기능**(부착 + GitLab 커밋 저장)으로 진행한다.
+## Step 2. 저장소 설정 (remote 존재 확인 후)
 
-- `gitlabHost`: URL을 조회하지 않는다. 사용자에게 직접 묻는다
-  (예: "GitLab 호스트가 `https://gitlab.example.com` 맞습니까?"). 이미 대상
-  레포 안에 다른 wz-editor 임베드가 있으면 그 값을 그대로 재사용한다
-  (아래 2-A 하위 항목 "기존 임베드 재사용" 참고 — 이 경우도 URL 조회 없이
-  기존 config script 블록을 Read/Grep으로 읽는 것뿐이라 안전하다).
-- `projectPath`: `git rev-parse --show-toplevel`로 얻은 레포 루트 폴더명,
-  또는 사용자가 알고 있는 GitLab 네임스페이스/프로젝트 경로
-  (예: `your-group/your-repo`)를 직접 확인받는다.
+`git remote`(인자 없이, 이름만)로 remote 존재를 확인했으면 **풀 기능**
+(부착 + **GitLab 또는 GitHub** 커밋 저장)으로 진행한다.
+
+- `provider`: 저장 백엔드를 `'gitlab'` 또는 `'github'`로 지정한다. 호스트를
+  사용자에게 직접 확인해 정한다(원격 URL 조회 금지 — 토큰 임베드 URL 노출
+  위험). GitHub(.com 또는 GitHub Enterprise)면 `'github'`, 사내/공개 GitLab이면
+  `'gitlab'`. 미지정 시 모듈이 host 문자열로 자동 추론하나, 명시를 권장한다.
+- 호스트:
+  - GitLab → `gitlabHost` (예: `https://gitlab.example.com`).
+  - GitHub → `apiBase` (기본값 `https://api.github.com`, GitHub Enterprise면
+    `https://<ghe-host>/api/v3`).
+  이미 대상 레포 안에 다른 wz-editor 임베드가 있으면 그 config 값을 그대로
+  재사용한다(URL 조회 없이 기존 config script 블록을 Read/Grep으로 읽는 것뿐이라
+  안전하다).
+- `projectPath`: `<네임스페이스>/<프로젝트>`(GitLab) 또는 `<owner>/<repo>`(GitHub).
+  `git rev-parse --show-toplevel`로 얻은 폴더명이나 사용자가 아는 경로를
+  직접 확인받는다.
 - `filePath`: 대상 HTML의 레포 루트 기준 상대 경로.
 - `branch`: `git branch --show-current` (또는 `git rev-parse --abbrev-ref HEAD`).
 
-### 2-B. 레포 밖 (git 레포가 아니거나 remote 없음)
+## Step 3. 자격 수집
 
-저장 백엔드가 없다는 것을 명확히 고지한다:
-
-> "이 문서는 git 레포에 속해 있지 않아 GitLab 커밋 저장 기능을 붙일 수
-> 없습니다. 편집·리치텍스트 서식·localStorage 초안까지는 동작하지만,
-> '저장' 버튼을 눌러도 서버에 반영되지 않습니다. 그래도 진행할까요?"
-
-사용자가 진행에 동의하면 `WZ_EDITOR_CONFIG`에서 `tokenSaltB64`/`tokenIvB64`/
-`tokenCipherB64`를 빈 문자열로 두고 부착한다(저장 클릭 시 wz-editor.js가
-내부적으로 에러 토스트를 띄우며 실패하지만 편집 내용 자체는 유지됨 —
-모듈 자체 동작, 별도 처리 불필요).
-
-## Step 3. 자격 수집 (2-A 풀 기능일 때만)
-
-1. **편집 비밀번호**: 사용자에게 입력받아 `crypto.subtle.digest('SHA-256', ...)`
-   와 동일한 결과가 나오도록 SHA-256 16진 해시로 변환한다(`pwHashHex`).
-   Node 환경이면 `node -e "console.log(require('crypto').createHash('sha256').update(process.argv[1]).digest('hex'))" "<비밀번호>"` 로 계산 가능하나,
-   **비밀번호를 argv로 넘기는 이 방식도 프로세스 목록 조회 시 노출 경로가
-   되므로**, 가능하면 Node REPL의 표준입력(stdin)으로 넘기거나 임시 스크립트
-   파일에 넣어 실행 후 즉시 삭제하는 방식을 우선한다.
-2. **GitLab 프로젝트 액세스 토큰**:
+1. **편집 비밀번호**: 사용자에게 편집 비밀번호를 정하게 한다. **`pwHashHex`
+   같은 해시는 계산하지 않는다**(이 스킬은 더 이상 pwHashHex를 쓰지 않는다).
+   비밀번호는 아래 2단계에서 토큰을 암호화할 때 함께 쓰이고, 편집 진입 시
+   인증은 "그 비밀번호로 토큰 복호화가 성공하는가"로 판정된다(AES-GCM 인증
+   태그가 곧 비밀번호 검증자 — 별도 해시를 페이지에 게시하지 않으므로 외부
+   열람자의 오프라인 크랙 표면이 없다).
+2. **프로젝트 액세스 토큰**:
    - 대상 레포에 기존 wz-editor 임베드가 있으면, 그 config script의
      `tokenSaltB64`/`tokenIvB64`/`tokenCipherB64` 값을 그대로 재사용할지
      제안한다(단, 이 경우 **편집 비밀번호도 기존 값과 동일해야** 복호화가
      성공한다 — 새 비밀번호를 원하면 토큰도 새로 암호화해야 함을 사용자에게
      고지).
-   - 기존 임베드가 없으면, 사용자에게 다음을 안내한다:
-     1. GitLab 프로젝트 → Settings → Access Tokens에서 토큰 발급
-        (권장 role: Maintainer, scope: `api`, 만료일 설정 권장).
-     2. 발급된 토큰 문자열을 **채팅에 붙여넣지 말고** 로컬 파일에 저장
+   - 기존 임베드가 없으면, provider별로 토큰을 발급받게 안내한다:
+     - **GitLab**: 프로젝트 → Settings → Access Tokens에서 발급
+       (권장 role: **Developer**, scope: `api`, 만료일 설정 권장).
+       Developer면 Files API 커밋은 가능하되 CI/CD 변수 열람 권한이 없어
+       토큰 유출 시 피해 범위가 좁다.
+     - **GitHub**: Settings → Developer settings → Personal access tokens.
+       fine-grained PAT면 대상 레포에 **Contents: Read and write** 권한만,
+       classic이면 `repo` scope. 만료일 설정 권장.
+     그다음 (provider 공통):
+     1. 발급된 토큰 문자열을 **채팅에 붙여넣지 말고** 로컬 파일에 저장
         (예: `token.txt`).
-     3. `node "<TEXTFIX_ROOT>/tools/encrypt-token.mjs" --token-file <token.txt 경로> <편집 비밀번호>`
-        실행 → 출력된 `tokenSaltB64`/`tokenIvB64`/`tokenCipherB64` 3값을 확보.
-     4. **토큰 파일을 즉시 삭제**(`rm token.txt` 또는 탐색기에서 삭제) —
+     2. `node "<TEXTFIX_ROOT>/tools/encrypt-token.mjs" --token-file <token.txt 경로> --password-stdin`
+        실행 → 프롬프트에 편집 비밀번호를 입력(stdin)한다. **비밀번호를 argv로
+        넘기지 않는다**(프로세스 목록·셸 히스토리 노출 차단 — argv 전달은
+        스크립트가 거부한다). 출력된 `tokenSaltB64`/`tokenIvB64`/`tokenCipherB64`
+        3값을 확보.
+     3. **토큰 파일을 즉시 삭제**(`rm token.txt` 또는 탐색기에서 삭제) —
         Claude가 대신 지워도 되지만, 사용자가 직접 지웠는지 확인 문구를
         마지막에 남긴다.
 
@@ -113,17 +141,20 @@ version: 0.1.0
    `<TEXTFIX_ROOT>/wz-editor.js`를 그 경로로 복사한다
    (이미 있으면 그대로 참조 — 임의로 덮어쓰지 않는다. 버전 차이가 의심되면
    사용자에게 갱신 여부를 확인).
-2. 대상 HTML에서 `</body>` 위치를 찾고, 그 직전에 마커 블록을 삽입한다:
+2. 대상 HTML에서 `</body>` 위치를 찾고, 그 직전에 마커 블록을 삽입한다.
+   provider에 맞는 config를 쓴다(풀 기능 모드에는 `pwHashHex`를 넣지 않는다 —
+   인증은 토큰 복호화 성공으로 판정):
 
+   **GitLab:**
    ```html
    <!-- wz-editor:start -->
    <script>
      window.WZ_EDITOR_CONFIG = {
+       provider: 'gitlab',
        gitlabHost: 'https://<확인받은 호스트>',
        projectPath: '<네임스페이스>/<프로젝트>',
        filePath: '<레포 루트 기준 상대경로>',
        branch: '<현재 브랜치>',
-       pwHashHex: '<Step 3에서 계산한 SHA-256 해시>',
        tokenSaltB64: '<Step 3 출력>',
        tokenIvB64: '<Step 3 출력>',
        tokenCipherB64: '<Step 3 출력>',
@@ -134,6 +165,29 @@ version: 0.1.0
    <!-- wz-editor:end -->
    ```
 
+   **GitHub** (차이: `provider`/`apiBase`, `projectPath`는 `<owner>/<repo>`):
+   ```html
+   <!-- wz-editor:start -->
+   <script>
+     window.WZ_EDITOR_CONFIG = {
+       provider: 'github',
+       apiBase: 'https://api.github.com',   // GitHub Enterprise면 https://<host>/api/v3
+       projectPath: '<owner>/<repo>',
+       filePath: '<레포 루트 기준 상대경로>',
+       branch: '<현재 브랜치>',
+       tokenSaltB64: '<Step 3 출력>',
+       tokenIvB64: '<Step 3 출력>',
+       tokenCipherB64: '<Step 3 출력>',
+       editableSelector: null
+     };
+   </script>
+   <script src="<문서 기준 wz-editor.js 상대경로>"></script>
+   <!-- wz-editor:end -->
+   ```
+
+   `tokenSaltB64`/`tokenIvB64`/`tokenCipherB64`가 비어 있으면 편집기는 부착되지
+   않는다(저장 백엔드가 필수 — 토큰 없는 부착 불가).
+
    `src`의 상대경로는 대상 HTML 파일 위치를 기준으로 계산한다(예: 문서가
    레포 루트에 있으면 `assets/js/wz-editor.js`, 하위 폴더에 있으면
    `../../assets/js/wz-editor.js` 등).
@@ -142,12 +196,14 @@ version: 0.1.0
 
 ## Step 5. 검증
 
-1. 로컬에서 `python -m http.server` (또는 동등 도구)로 대상 디렉터리를
-   서빙하고, 부착한 HTML을 브라우저(Claude Browser MCP 등)로 열어 확인:
+1. 로컬에서 `python -m http.server --bind 127.0.0.1 <port>` (또는 동등 도구)로
+   대상 디렉터리를 서빙하고(0.0.0.0 전체 바인드 금지 — 암호문 config가 든 레포가
+   LAN에 노출된다), 부착한 HTML을 브라우저(Claude Browser MCP 등)로 열어 확인:
    - 우측 상단 연필 아이콘(FAB)이 보이는가
    - 클릭 시 비밀번호 모달이 뜨는가, 올바른 비밀번호로 편집모드 진입하는가
    - 편집모드에서 텍스트 수정 → 저장 시 토스트/에러가 예상대로 뜨는가
-     (레포 밖 모드면 실패 토스트가 정상 — 에러 아님)
+     (부착 검증 단계에선 placeholder 토큰이라 저장이 실패 토스트로 끝나는 것이
+     정상 — 실토큰은 실제 배포 시 주입)
 2. `git diff`로 실제 삽입된 내용이 마커 블록(`<!-- wz-editor:start -->`~
    `<!-- wz-editor:end -->`)뿐인지 확인한다 — 기존 콘텐츠 무손상 검증.
 3. 커밋/푸시는 **사용자 확인 후에만** 진행한다(저장소에 대한 쓰기 작업이므로
@@ -167,13 +223,20 @@ version: 0.1.0
 
 ## 보안 고지 (사용자에게 반드시 전달)
 
-- 비밀번호를 아는 사람은 누구나 브라우저 devtools에서 복호화된 토큰
-  평문을 볼 수 있다. AES-GCM 암호화는 "비밀번호를 몰라도 토큰을 못 본다"는
+- 인증은 "그 비밀번호로 토큰 복호화가 성공하는가"로 판정한다 — 비밀번호 검증용
+  해시(`pwHashHex`)를 페이지에 게시하지 않으므로 외부 열람자의 오프라인 크랙
+  표면이 없다. 다만 **비밀번호를 아는 사람**은 브라우저 devtools에서 복호화된
+  토큰 평문을 볼 수 있다. AES-GCM 암호화는 "비밀번호를 몰라도 토큰을 못 본다"는
   뜻일 뿐, 비밀번호 아는 내부자로부터의 보호는 아니다.
-- 이 구조는 **내부망 저위험 문서** 용도로만 사용한다. 토큰은 해당 레포
-  한정 스코프(`api`)와 만료일을 설정해 피해 범위를 제한할 것을 권장한다.
-- 토큰 원문은 채팅, argv, 스킬 산출물 어디에도 남기지 않는다. 유출 의심
-  시 즉시 GitLab에서 토큰을 폐기(revoke)하고 재발급한다.
+- 이 구조는 **내부망 저위험 문서** 용도로만 사용한다. 토큰은 해당 레포 한정
+  최소 권한(GitLab: role Developer + scope `api` / GitHub: Contents 쓰기만)과
+  만료일을 설정해 피해 범위를 제한할 것을 권장한다.
+- 토큰 원문은 채팅, argv, 스킬 산출물 어디에도 남기지 않는다(암호화 도구도
+  비밀번호를 stdin으로만 받는다). 유출 의심 시 즉시 GitLab/GitHub에서 토큰을
+  폐기(revoke)하고 재발급한다.
+- 편집 초안(localStorage)은 7일 후 자동 만료된다. GitLab/GitHub Pages가 path
+  공유 도메인이면 같은 호스트의 다른 프로젝트가 초안을 읽을 수 있으므로,
+  unique-domain(프로젝트별 하위 도메인) 배포를 권장한다.
 
 ## 산출물 경로 요약
 
