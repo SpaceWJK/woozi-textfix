@@ -171,6 +171,17 @@ reading the token — it does nothing against someone who has it.
   decrypt-and-commit step with a small server-side proxy that holds the
   token and only ever accepts the password from the client.
 
+### Security review evidence
+
+Core items reviewed before release:
+
+| Check | Method | Result |
+|-------|--------|--------|
+| No unauthorized document persistence | Full grep of localStorage/IndexedDB/cookie/file-write/remote-logging + source read | **PASS** |
+| No external exfiltration path | Full grep of fetch/XHR/sendBeacon/WebSocket/tracking-pixel — network calls limited to the configured repo API only | **PASS** |
+| Token encryption design | PBKDF2-SHA256 600,000 iterations + AES-256-GCM (random salt/IV) source read + encrypt/decrypt round-trip | **PASS** |
+| Password verifier | Auth = successful token decryption (no separate password hash is published → no offline-crack surface) source read + analysis | **PASS** |
+
 ## Limitations
 
 - No real access control — see Security model above.

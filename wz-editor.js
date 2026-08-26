@@ -80,11 +80,33 @@
     } catch (e) {
       inferredIsGithub = false;
     }
+    // m-1: a self-hosted GitHub Enterprise Server apiBase (a custom domain, not github.com /
+    // api.github.com / *.githubusercontent.com) fails every hostname check above and used to fall
+    // straight through to 'gitlab' -- silently wrong, since GITLAB_HOST would then resolve to its
+    // own truthy placeholder default ('https://gitlab.example.com') rather than the intended host.
+    // apiBase is GitHub's config key (GitLab's analogous key is gitlabHost); an embed that gives
+    // apiBase but no gitlabHost at all is an explicit GitHub signal even when the hostname itself
+    // doesn't match the well-known github.com family.
+    if (!inferredIsGithub && CFG.apiBase && !CFG.gitlabHost) {
+      inferredIsGithub = true;
+    }
     PROVIDER = inferredIsGithub ? 'github' : 'gitlab';
   }
   var API_BASE = CFG.apiBase || (PROVIDER === 'github' ? 'https://api.github.com' : GITLAB_HOST);
+
+  // R1 (partial -- see fetchLatest()/commitFile() below for why it stops here): per-provider host
+  // lookup, replacing the `PROVIDER === 'github' ? A : B` ternary this line used to be with a table.
+  // This table intentionally does NOT also take over dispatching to fetchLatestGitHub/
+  // fetchLatestGitLab/commitGitHub/commitToGitLab -- those functions (and the fetchLatest/commitFile
+  // ternaries that pick between them) are individually extracted from this source file's text and
+  // run in isolated vm sandboxes by existing regression tests (test-github-provider.mjs,
+  // test-a-error-body-redaction.mjs) that do not include a PROVIDERS declaration in what they
+  // extract; a dispatch body referencing PROVIDERS there throws "PROVIDERS is not defined" even
+  // though it works fine when this file loads normally. This line isn't part of any such extraction,
+  // so it's free to route through PROVIDERS.
+  var PROVIDERS = { gitlab: GITLAB_HOST, github: API_BASE };
   // The host actually used for this provider's network calls -- what F-3 below must validate.
-  var ACTIVE_HOST = PROVIDER === 'github' ? API_BASE : GITLAB_HOST;
+  var ACTIVE_HOST = PROVIDERS[PROVIDER] || PROVIDERS.gitlab;
 
   // F-3: a token always exists now (B: tokenCipherB64 is mandatory, checked above), so this host
   // validation always runs unconditionally -- the active host must be https, and if the embed
@@ -129,10 +151,15 @@
   // ===================================================================
   var CSS = ''
     + '.wz-edit-fab{position:fixed;right:26px;top:24px;z-index:81;width:38px;height:38px;border-radius:50%;'
-    + '  border:1px solid #e3e7ec;background:rgba(255,255,255,.85);color:#9aa4b2;'
+    // M-U2: icon color was #9aa4b2 on the ~white fab background (measured contrast 2.52:1, below the
+    // WCAG 1.4.11 non-text 3:1 floor). #4b5563 keeps the same neutral-gray tone but reaches ~7.6:1
+    // against a white backdrop (worst-case underlying page color, since the fab bg is a translucent
+    // white that resolves to whatever's behind it) -- comfortably clears both the 3:1 floor and the
+    // 4.5:1 text-level target this fix aims for.
+    + '  border:1px solid #e3e7ec;background:rgba(255,255,255,.85);color:#4b5563;'
     + '  display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(18,35,63,.1);'
     + '  transition:color .15s,opacity .15s;opacity:.9;}'
-    + '.wz-edit-fab:hover{color:#5b6472;}'
+    + '.wz-edit-fab:hover{color:#1c2b3a;}'
     + 'body.wz-edit-mode .wz-edit-fab{display:none;}'
     + '@media print{ .wz-edit-fab{display:none !important;} }'
 
@@ -159,6 +186,12 @@
     + '@keyframes wzEditPulse{0%,100%{opacity:1;}50%{opacity:.3;}}'
     + '.wz-edit-toolbar-label{font-size:13px;font-weight:700;letter-spacing:.02em;}'
     + '.wz-edit-toolbar-toast{font-size:12.5px;color:#bcd2f7;flex:1;}'
+    // P3-4: compact optional commit-memo input, styled to match the toolbar's existing dark chrome
+    // (same treatment as .wz-fmt-select) rather than a default white text input.
+    + '.wz-edit-commit-msg{flex:0 1 220px;min-width:110px;padding:5px 10px;border-radius:6px;'
+    + '  border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#fff;font-size:12.5px;}'
+    + '.wz-edit-commit-msg::placeholder{color:rgba(255,255,255,.55);}'
+    + '.wz-edit-commit-msg:focus{outline:2px solid #2563eb;outline-offset:1px;}'
     + '.wz-edit-toolbar-actions{display:flex;gap:8px;margin-left:auto;}'
     + '.wz-edit-toolbar-btn{padding:6px 16px;border-radius:7px;font-size:13px;font-weight:700;cursor:pointer;border:1px solid transparent;}'
     + '.wz-edit-toolbar-btn-cancel{background:rgba(255,255,255,.12);color:#fff;}'
@@ -166,7 +199,13 @@
     + '.wz-edit-toolbar-btn-save{background:#15803d;color:#fff;}'
     + '.wz-edit-toolbar-btn-save:hover{background:#1f8a52;}'
     + '.wz-edit-toolbar-btn:disabled{opacity:.5;cursor:default;}'
-    + 'body.wz-edit-mode{padding-top:78px;}'
+    // C2: 78px only covered a single-row toolbar. The format bar (.wz-edit-format-bar, width:100%)
+    // wraps the toolbar onto 2 rows (and more on narrow viewports), so 78px left H1 covered on every
+    // viewport. This static value is a generous single-row-covering floor only -- the real,
+    // viewport-accurate padding is computed from the toolbar's rendered offsetHeight in
+    // measureAndSetToolbarPadding() (see enterEditMode) and applied as an inline style that
+    // overrides this rule the instant edit mode is entered.
+    + 'body.wz-edit-mode{padding-top:110px;}'
 
     + '.wz-edit-format-bar{display:flex;width:100%;align-items:center;gap:6px;padding-top:8px;margin-top:6px;'
     + '  border-top:1px solid rgba(255,255,255,.15);flex-wrap:wrap;}'
@@ -185,9 +224,18 @@
     + '.wz-fmt-color-btn:hover{border-color:#fff;}'
     + '.wz-fmt-color-default{background:#2b2b2b;}'
 
-    + '.wz-draft-banner{position:fixed;top:0;left:0;right:0;z-index:260;display:none;align-items:center;gap:14px;'
+    // M-U3: every other injected bar (.wz-edit-toolbar, .wz-edit-format-bar) wraps at narrow widths
+    // or 200% zoom except this one -- add flex-wrap so its text+actions reflow instead of
+    // overflowing/clipping.
+    + '.wz-draft-banner{position:fixed;top:0;left:0;right:0;z-index:260;display:none;align-items:center;gap:14px;flex-wrap:wrap;'
     + '  padding:10px 20px;background:#fff7ed;border-bottom:2px solid #c2410c;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}'
     + '.wz-draft-banner.active{display:flex;}'
+    // C3: no body compensation existed for the banner's own height (~53px single-row, more once it
+    // wraps per the flex-wrap fix above) -- it overlapped/covered page content underneath, most
+    // visibly the title. 64px is a generous single-row-covering floor; the real, wrap-aware value is
+    // computed from the banner's rendered offsetHeight in measureAndSetBannerPadding() (see
+    // showDraftBannerIfAny) and applied as an inline style that overrides this rule.
+    + 'body.wz-draft-banner-active{padding-top:64px;}'
     + '.wz-draft-banner-text{font-size:13px;font-weight:700;color:#c2410c;}'
     + '.wz-draft-banner-actions{display:flex;gap:8px;margin-left:auto;}'
     + '.wz-draft-banner-btn{padding:5px 14px;border-radius:6px;font-size:12.5px;font-weight:700;cursor:pointer;border:1px solid #c2410c;background:#fff;color:#c2410c;}'
@@ -221,7 +269,9 @@
     + '</button>'
 
     + '<div class="wz-pw-modal-overlay" id="wzPwModalOverlay">'
-    + '  <div class="wz-pw-modal-box" id="wzPwModalBox">'
+    // M-U1: role="dialog"+aria-modal so assistive tech announces this as a modal dialog (it had
+    // neither before -- a screen reader user tabbing in had no signal they'd entered one).
+    + '  <div class="wz-pw-modal-box" id="wzPwModalBox" role="dialog" aria-modal="true" aria-label="편집 비밀번호 입력">'
     + '    <div class="wz-pw-modal-title">편집 비밀번호</div>'
     + '    <input type="password" id="wzPwModalInput" class="wz-pw-modal-input" autocomplete="off" placeholder="비밀번호 입력">'
     + '    <div class="wz-pw-modal-err" id="wzPwModalErr">비밀번호가 올바르지 않습니다.</div>'
@@ -236,6 +286,8 @@
     + '  <span class="wz-edit-toolbar-dot"></span>'
     + '  <span class="wz-edit-toolbar-label">편집 중</span>'
     + '  <span class="wz-edit-toolbar-toast" id="wzEditToast"></span>'
+    + '  <input type="text" class="wz-edit-commit-msg" id="wzCommitMsgInput" maxlength="200" '
+    + '    placeholder="커밋 메모(선택)" aria-label="커밋 메모(선택, 비우면 기본 메시지 사용)">'
     + '  <div class="wz-edit-toolbar-actions">'
     + '    <button type="button" class="wz-edit-toolbar-btn wz-edit-toolbar-btn-cancel" id="wzEditCancelBtn">취소</button>'
     + '    <button type="button" class="wz-edit-toolbar-btn wz-edit-toolbar-btn-save" id="wzEditSaveBtn">저장</button>'
@@ -298,6 +350,7 @@
   var pwSubmit = document.getElementById('wzPwModalSubmit');
   var pwCancel = document.getElementById('wzPwModalCancel');
   var editToast = document.getElementById('wzEditToast');
+  var commitMsgInput = document.getElementById('wzCommitMsgInput'); // P3-4
   var editCancelBtn = document.getElementById('wzEditCancelBtn');
   var editSaveBtn = document.getElementById('wzEditSaveBtn');
   var draftBanner = document.getElementById('wzDraftBanner');
@@ -363,10 +416,22 @@
       throw new Error('원본 최신본 조회 실패 (GitHub API ' + res.status + ')'); // A: status only, see fetchLatestGitLab's comment above.
     }
     var json = await res.json();
+    // m-3: GitHub's contents API returns an *array* (no .content field) when filePath resolves to a
+    // directory instead of a file -- json.content would then be undefined, and base64ToUtf8(undefined)
+    // throws an opaque TypeError deep inside atob() instead of a message that points at the actual
+    // misconfiguration.
+    if (!json || typeof json.content !== 'string') {
+      throw new Error('filePath가 파일이 아닙니다 (GitHub API 응답에 content 없음 — 디렉터리 경로일 수 있습니다)');
+    }
     // GitHub requires the file's current sha to be echoed back on the update commit (PUT), or
     // the write is rejected with 409 -- carry it alongside the html for buildEditedSource/commit.
     return {html: base64ToUtf8(json.content), sha: json.sha};
   }
+  // NOTE: kept as a direct ternary (not routed through PROVIDERS below) intentionally --
+  // test-github-provider.mjs extracts this function's source text and runs it concatenated with
+  // ONLY fetchLatestGitHub/fetchLatestGitLab/encodePath/base64 helpers in an isolated vm sandbox
+  // (no PROVIDERS in scope there), so a body that references PROVIDERS would throw
+  // "PROVIDERS is not defined" in that test even though it works fine when this file loads normally.
   async function fetchLatest(token){
     return PROVIDER === 'github' ? fetchLatestGitHub(token) : fetchLatestGitLab(token);
   }
@@ -380,9 +445,16 @@
   }
   function collectEditables(){
     editableEls = collectEditablesFrom(document);
+    origInnerMap.clear(); // C1: full reset, not just overwrite -- avoids stale idx keys surviving a re-collect onto a shorter list.
     editableEls.forEach(function(el, idx){ origInnerMap.set(idx, el.innerHTML); });
   }
-  collectEditables();
+  // P3-1: collectEditablesFrom()'s O(n^2) containment filter used to run unconditionally at module
+  // load, so every visitor who never edits (the common case for a published document) still paid
+  // that cost on every page load. It is only ever needed once someone actually enters edit mode, so
+  // the initial collection is deferred to the two requireAuth-success entry points below (FAB click
+  // and draft-restore click) instead of running here. showDraftBannerIfAny() and
+  // beforeUnloadHandler() do not read editableEls (only localStorage), so they are unaffected by
+  // editableEls starting out empty.
 
   // B: sha256Hex() removed -- it existed only to compare against the now-removed pwHashHex
   // fallback (demo mode). Auth is decrypt-success-only (F-1); there is no other consumer.
@@ -502,6 +574,23 @@
   pwInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') submitPassword(); });
   pwCancel.addEventListener('click', closePwModal);
   pwOverlay.addEventListener('click', function(e){ if (e.target === pwOverlay) closePwModal(); });
+  // M-U1: focus trap + Escape-to-close. Before this, Tab from the last control (확인) escaped the
+  // modal into whatever's behind it (e.g. the FAB), and there was no keyboard way to dismiss the
+  // dialog short of a mouse click -- both are WCAG 2.1 keyboard-operability expectations for a
+  // modal dialog.
+  var pwFocusables = [pwInput, pwCancel, pwSubmit];
+  pwBox.addEventListener('keydown', function(e){
+    if (e.key === 'Escape'){ closePwModal(); return; }
+    if (e.key !== 'Tab') return;
+    var first = pwFocusables[0], last = pwFocusables[pwFocusables.length - 1];
+    if (e.shiftKey){
+      if (document.activeElement === first || pwFocusables.indexOf(document.activeElement) === -1){
+        e.preventDefault(); last.focus();
+      }
+    } else if (document.activeElement === last){
+      e.preventDefault(); first.focus();
+    }
+  });
 
   // The password gate stays open for the lifetime of the tab: once authenticated in a given tab
   // (editPassword captured), clicking the pencil icon or restoring a draft again re-enters edit
@@ -514,6 +603,15 @@
     openPwModal(onReady);
   }
 
+  // C2: the toolbar is 2 rows in practice (the format bar wraps under the label/actions row) and
+  // grows to more rows on narrow viewports -- measure its actual rendered height (only accurate
+  // once 'wz-edit-mode' has made it display:flex) and set body's padding-top to match, so the
+  // title is never covered regardless of viewport width or how many rows the toolbar wraps to.
+  var editToolbarEl = document.getElementById('wzEditToolbar');
+  function measureAndSetToolbarPadding(){
+    var h = editToolbarEl ? editToolbarEl.offsetHeight : 0;
+    document.body.style.paddingTop = h ? (h + 4) + 'px' : '';
+  }
   function enterEditMode(draftToApply){
     document.body.classList.add('wz-edit-mode');
     editableEls.forEach(function(el, idx){
@@ -529,18 +627,23 @@
     document.addEventListener('input', onEditableInput, true);
     document.addEventListener('paste', onEditablePaste, true);
     document.addEventListener('drop', onEditableDrop, true);
-    hideDraftBanner();
+    hideDraftBanner(); // clears any banner-driven padding-top before we set the toolbar's own.
+    measureAndSetToolbarPadding();
+    window.addEventListener('resize', measureAndSetToolbarPadding);
   }
   function exitEditMode(){
     document.removeEventListener('input', onEditableInput, true);
     document.removeEventListener('paste', onEditablePaste, true);
     document.removeEventListener('drop', onEditableDrop, true);
+    window.removeEventListener('resize', measureAndSetToolbarPadding);
+    document.body.style.paddingTop = ''; // C2: drop the inline override so it can't outlive edit mode.
     clearTimeout(draftTimer);
     editableEls.forEach(function(el){
       el.removeAttribute('contenteditable');
       el.removeAttribute('data-wz-editable');
     });
     document.body.classList.remove('wz-edit-mode');
+    if (commitMsgInput) commitMsgInput.value = ''; // P3-4: don't carry a stale memo into the next edit session.
     window.removeEventListener('beforeunload', beforeUnloadHandler);
     // editPassword is intentionally not cleared here — see the tab-session auth note above.
     // Only a reload/tab close drops this closure variable and requires re-authentication.
@@ -571,9 +674,13 @@
     e.preventDefault();
     insertSanitizedHtmlOrText(host, e.dataTransfer);
   }
-  editFab.addEventListener('click', function(){ requireAuth(function(){ enterEditMode(null); }); });
+  editFab.addEventListener('click', function(){ requireAuth(function(){ collectEditables(); enterEditMode(null); }); });
 
   editCancelBtn.addEventListener('click', function(){
+    // m-2: the button being visually/functionally disabled during isSaving (toggled in doSave)
+    // already blocks native clicks, but guard here too in case something dispatches a synthetic
+    // click while the disabled state hasn't been applied yet.
+    if (isSaving) return;
     if (!confirm('편집 내용을 취소하고 원래대로 되돌릴까요?')) return;
     clearTimeout(draftTimer);
     localStorage.removeItem(DRAFT_KEY);
@@ -677,10 +784,24 @@
     });
     if (!any){ localStorage.removeItem(DRAFT_KEY); return; }
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify({savedAt: Date.now(), edits: edits})); }
-    catch(e){}
+    catch(e){
+      // M-F1: this used to fail completely silently (quota exceeded, private/incognito mode
+      // blocking localStorage, etc.) -- which also silently defeats the beforeunload/tab-close
+      // recovery net (hasUnsavedDraft() reads the same key), so an edit could be lost with zero
+      // warning of any kind. Surface it via the toolbar toast (visible during editing).
+      setToast('초안 저장 실패(저장소 용량 등) — 저장 전 이탈 시 편집 내용이 사라질 수 있습니다');
+    }
   }
   function hasUnsavedDraft(){ return !!localStorage.getItem(DRAFT_KEY); }
 
+  // C3: the banner (~53px, more once M-U3's flex-wrap kicks in on narrow viewports) had no matching
+  // body padding, so it sat on top of and covered page content -- most visibly the title. Measure
+  // the banner's actual rendered height the same way measureAndSetToolbarPadding() does for the
+  // toolbar, so it stays correct however many rows the banner wraps to.
+  function measureAndSetBannerPadding(){
+    var h = draftBanner ? draftBanner.offsetHeight : 0;
+    document.body.style.paddingTop = h ? (h + 4) + 'px' : '';
+  }
   function showDraftBannerIfAny(){
     var raw = localStorage.getItem(DRAFT_KEY);
     if (!raw) return;
@@ -695,10 +816,14 @@
     pendingRecoverDraft = parsed;
     draftBanner.classList.add('active');
     document.body.classList.add('wz-draft-banner-active');
+    measureAndSetBannerPadding();
+    window.addEventListener('resize', measureAndSetBannerPadding);
   }
   function hideDraftBanner(){
     draftBanner.classList.remove('active');
     document.body.classList.remove('wz-draft-banner-active');
+    window.removeEventListener('resize', measureAndSetBannerPadding);
+    document.body.style.paddingTop = ''; // C3: drop the inline override (enterEditMode sets its own right after).
   }
   draftDiscardBtn.addEventListener('click', function(){
     localStorage.removeItem(DRAFT_KEY);
@@ -707,7 +832,7 @@
   });
   draftRestoreBtn.addEventListener('click', function(){
     var draft = pendingRecoverDraft;
-    requireAuth(function(){ enterEditMode(draft); });
+    requireAuth(function(){ collectEditables(); enterEditMode(draft); });
   });
   showDraftBannerIfAny();
 
@@ -772,6 +897,15 @@
       touchedCount++;
       var target = structuralDrift ? null : origCandidates[idx];
       if (!target){ mismatchCount++; return; }
+      // C4 (minimal mitigation): index-based matching alone can't detect a same-count reshuffle
+      // (paragraphs reordered without any added/removed) -- the index still resolves to *a* element,
+      // just not the one this edit was made against. Full identity matching is out of scope here
+      // (needs a per-element identifier, tracked separately); as a floor, verify the *remote*
+      // baseline at this index still matches what our local session started from. If it doesn't,
+      // this slot was touched by something outside this editing session (a reorder, or someone
+      // else's commit) since we captured origInnerMap -- abort this index as a mismatch rather than
+      // blindly overwriting whatever now sits at that position.
+      if (target.innerHTML !== orig){ mismatchCount++; return; }
       // F-2 sink 3: defense in depth. Paste/drop and draft-restore are already sanitized at their
       // own sinks, but this is the last point before the edited HTML is written into the document
       // that gets committed — sanitize here too so no future or overlooked input path can slip
@@ -792,7 +926,21 @@
     return {html: html, changedCount: changedCount, mismatchCount: mismatchCount, touchedCount: touchedCount, structuralDrift: structuralDrift, leaked: leaked};
   }
   function utf8ToBase64(str){ return btoa(unescape(encodeURIComponent(str))); }
-  async function commitToGitLab(newHtml, token){
+  // P3-4: the commit message box is a plain API request body field (not rendered as HTML anywhere),
+  // so this is hygiene rather than an XSS sanitizer -- collapse newlines/tabs (a multi-line commit
+  // body isn't useful for this single-line memo field, and a raw newline in a GitLab/GitHub commit
+  // message API field is otherwise harmless but visually messy in the resulting commit log) and cap
+  // length defensively (the input already has maxlength, but a value set programmatically or pasted
+  // in a way that bypasses it should not be trusted blindly).
+  function sanitizeCommitMessage(raw){
+    var s = String(raw || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return s.length > 200 ? s.slice(0, 200) : s;
+  }
+  // P3-4: commitMessage is an optional param (defaulted to the module's original hardcoded string
+  // when falsy) -- kept optional rather than required so a direct call with the old 2/3-arg shape
+  // (as the existing scratchpad regression tests and this file's own default-fallback callers do)
+  // keeps behaving exactly as before.
+  async function commitToGitLab(newHtml, token, commitMessage){
     var url = GITLAB_HOST + '/api/v4/projects/' + encodeURIComponent(GITLAB_PROJECT_PATH)
       + '/repository/files/' + encodeURIComponent(GITLAB_FILE_PATH);
     var res = await fetch(url, {
@@ -802,7 +950,7 @@
         branch: GITLAB_BRANCH,
         content: utf8ToBase64(newHtml),
         encoding: 'base64',
-        commit_message: 'report: in-page edit'
+        commit_message: commitMessage || 'report: in-page edit'
       })
     });
     // A: status only -- see fetchLatestGitLab's comment above (same reasoning for the commit path).
@@ -811,7 +959,7 @@
     }
     return res.json();
   }
-  async function commitGitHub(newHtml, token, sha){
+  async function commitGitHub(newHtml, token, sha, commitMessage){
     var url = API_BASE + '/repos/' + GITLAB_PROJECT_PATH + '/contents/' + encodePath(GITLAB_FILE_PATH);
     var res = await fetch(url, {
       method: 'PUT',
@@ -822,7 +970,7 @@
         'X-GitHub-Api-Version': '2022-11-28'
       },
       body: JSON.stringify({
-        message: 'report: in-page edit',
+        message: commitMessage || 'report: in-page edit',
         content: utf8ToBase64(newHtml),
         branch: GITLAB_BRANCH,
         sha: sha // required by GitHub's contents API when updating an existing file -- omitting it (or a stale value) is rejected with 409.
@@ -833,33 +981,65 @@
     }
     return res.json();
   }
-  async function commitFile(newHtml, token, sha){
-    return PROVIDER === 'github' ? commitGitHub(newHtml, token, sha) : commitToGitLab(newHtml, token);
+  // NOTE: same reason as fetchLatest() above -- test-github-provider.mjs and
+  // test-a-error-body-redaction.mjs extract commitGitHub/commitToGitLab (and this dispatcher)
+  // individually and run them without PROVIDERS in scope.
+  async function commitFile(newHtml, token, sha, commitMessage){
+    return PROVIDER === 'github' ? commitGitHub(newHtml, token, sha, commitMessage) : commitToGitLab(newHtml, token, commitMessage);
   }
   async function doSave(){
     isSaving = true;
     editSaveBtn.disabled = true;
-    setToast('저장 중…');
+    editCancelBtn.disabled = true; // m-2: cancel used to stay clickable during save and race location.reload() against the in-flight PUT.
+    // P3-2: staged progress text instead of one static "저장 중…" for the whole fetch->diff->commit
+    // span, which can take a noticeable moment on a large document. Kept to plain toast-text updates
+    // (no spinner/progress-bar widget) -- proportionate to what a sequence of 3 short network/CPU
+    // steps needs.
+    setToast('최신본 확인 중…');
     try {
       // F-1: reuse the token decrypted at auth time (cachedToken) instead of re-decrypting here —
       // avoids a second PBKDF2 derivation (600k iterations) on every save. Falls back to a fresh
       // decrypt only defensively (e.g. cachedToken somehow unset while editPassword is present).
       var token = cachedToken || await decryptToken(editPassword);
       var latest = await fetchLatest(token); // {html, sha} -- sha is null for GitLab, required by GitHub's update commit.
+      setToast('변경 반영 중…');
       var diff = buildEditedSource(latest.html);
       if (diff.touchedCount === 0){
         setToast('변경된 내용이 없습니다');
         return;
       }
       if (diff.mismatchCount > 0 || diff.structuralDrift){
-        throw new Error('반영 불가 ' + diff.mismatchCount + '건 — 원본 문서 구조가 변경되어 편집을 안전하게 반영할 수 없습니다(커밋 중단). 새로고침 후 다시 편집해 주세요.');
+        // P3-3: distinguish *why* the safe-merge check failed instead of one generic "구조가
+        // 변경되어" message for both causes. structuralDrift (origCandidates.length !== editableEls.length,
+        // see buildEditedSource) means the element COUNT itself changed -- true structural drift.
+        // A non-structural mismatch (C4's index-identity check: `target.innerHTML !== orig`) means the
+        // count is the same but the specific slot this edit targeted was altered by something outside
+        // this editing session (someone else's commit, or a same-count reorder) since this session's
+        // baseline was captured -- that is a genuine multi-editor collision, not a structure change,
+        // and deserves its own wording so the user understands why a plain refresh+redo is needed.
+        var conflictMsg = diff.structuralDrift
+          ? ('반영 불가 ' + diff.mismatchCount + '건 — 원본 문서 구조(요소 개수)가 변경되어 편집을 안전하게 반영할 수 없습니다(커밋 중단). 새로고침 후 다시 편집해 주세요.')
+          : ('다른 곳에서 이 문서가 수정되어(편집 충돌) 안전하게 반영할 수 없습니다 — 새로고침 후 다시 편집해 주세요. (충돌 ' + diff.mismatchCount + '건)');
+        throw new Error(conflictMsg);
       }
       if (diff.leaked.length){
         throw new Error('내부 검증 실패: 저장본에 편집 UI 잔재 발견(' + diff.leaked.join(',') + ') — 커밋 중단');
       }
-      await commitFile(diff.html, token, latest.sha);
+      setToast('커밋 중…');
+      // P3-4: optional user-entered commit memo (sanitizeCommitMessage strips newlines/control chars
+      // and caps length; falls back to the module's default message when empty).
+      var commitMsg = sanitizeCommitMessage(commitMsgInput ? commitMsgInput.value : '');
+      await commitFile(diff.html, token, latest.sha, commitMsg);
       lastCommitAt = Date.now();
       localStorage.removeItem(DRAFT_KEY);
+      // C1: re-baseline against the now-committed DOM state. Without this, origInnerMap stays
+      // pinned to the value from the very first page load, so (a) a second edit-and-save in the same
+      // tab session sees every already-committed element as "changed" and recommits it verbatim
+      // (duplicate commit with no real diff), and (b) if someone else's commit landed between our
+      // save and a later one in this tab, a subsequent no-op re-save could still carry our stale
+      // local copy over their change. Re-collecting resets both editableEls and origInnerMap to the
+      // DOM as it stands right after this commit succeeded.
+      collectEditables();
       var isPartial = diff.changedCount < diff.touchedCount;
       var successMsg = '저장됨 — 사이트 반영까지 1~2분(파이프라인). 반영 ' + diff.changedCount + '건 / 전체 편집 ' + diff.touchedCount + '건';
       setToast(successMsg);
@@ -870,6 +1050,7 @@
     } finally {
       isSaving = false;
       editSaveBtn.disabled = false;
+      editCancelBtn.disabled = false;
       if (pendingSaveQueued){ pendingSaveQueued = false; requestSave(); }
     }
   }

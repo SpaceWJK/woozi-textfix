@@ -158,6 +158,7 @@ version: 0.1.0
        tokenSaltB64: '<Step 3 출력>',
        tokenIvB64: '<Step 3 출력>',
        tokenCipherB64: '<Step 3 출력>',
+       allowedHosts: ['<확인받은 호스트의 도메인>'],   // 권장: 토큰이 전송될 호스트를 고정(변조 시 전송 차단)
        editableSelector: null
      };
    </script>
@@ -178,6 +179,7 @@ version: 0.1.0
        tokenSaltB64: '<Step 3 출력>',
        tokenIvB64: '<Step 3 출력>',
        tokenCipherB64: '<Step 3 출력>',
+       allowedHosts: ['api.github.com'],   // 권장: 토큰이 전송될 호스트를 고정(변조 시 전송 차단). GHE면 그 호스트
        editableSelector: null
      };
    </script>
