@@ -1,0 +1,68 @@
+<!-- Fixture 1: report-style excerpt using the OLD hardcoded default-selector class names
+     (kpi-desc, insight-body, tl-step, etc. -- see the pre-refactor DEFAULT_EDIT_SEL this module used
+     to hardcode). Purpose: demonstrate the new generic heuristic collects at least the same elements
+     the old class-based selector would have (superset property), on a document the old selector was
+     actually tuned for. -->
+<h1>2026년 6월 토큰 사용량 리포트</h1>
+<h2>월간 요약</h2>
+<div class="cover">
+  <p class="lead">이번 달 토큰 사용량은 전월 대비 12% 증가했습니다.</p>
+  <span class="tag">INTERNAL</span>
+</div>
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-value">128,500</div>
+    <div class="kpi-label">총 요청 수</div>
+    <div class="kpi-desc">전월 대비 +8.2% 증가한 수치입니다.</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-value">42.1M</div>
+    <div class="kpi-label">총 토큰</div>
+    <div class="kpi-desc">캐시 적중률 개선으로 순증가는 제한적이었습니다.</div>
+  </div>
+</div>
+<section class="insight">
+  <div class="insight-title">캐시 적중률 개선</div>
+  <div class="insight-body">
+    prompt caching 도입 이후 반복 호출 비용이 눈에 띄게 감소했습니다. 특히 대형 컨텍스트를 반복
+    사용하는 워크플로우에서 효과가 컸습니다.
+  </div>
+  <span class="insight-tag">비용절감</span>
+</section>
+<ul>
+  <li>세션당 평균 토큰 사용량 12% 감소</li>
+  <li>피크 시간대 사용량은 오히려 증가</li>
+</ul>
+<table>
+  <tr><th>항목</th><th>값</th></tr>
+  <tr><td>총 세션 수</td><td>3,214</td></tr>
+</table>
+<div class="timeline">
+  <div class="tl-step">1단계</div>
+  <div class="tl-q">캐싱을 도입하면 얼마나 절감될까?</div>
+  <div class="tl-result">약 30% 절감 확인</div>
+  <div class="tl-learn">반복 호출 비율이 높을수록 효과가 크다</div>
+  <span class="tl-badge">완료</span>
+</div>
+<div class="card">
+  <h4>다음 단계</h4>
+  <p>남은 워크플로우에도 순차적으로 캐싱을 적용할 예정입니다.</p>
+</div>
+<div class="callout">주의: 캐시 TTL이 만료되면 비용이 다시 증가할 수 있습니다.</div>
+<div class="conclusion">
+  <div class="conclusion-label">결론</div>
+  <div class="conclusion-body">캐싱 전략은 효과적이었으나 모니터링이 지속적으로 필요합니다.</div>
+</div>
+
+<!-- wz-editor's own UI chrome -- must never become editable, regardless of what's nested inside it. -->
+<div class="wz-edit-fab"><span>편집</span></div>
+<div class="wz-edit-toolbar"><span class="wz-edit-toolbar-label">편집 중</span></div>
+
+<!-- structural exclusions: script/style text must never surface as an editable "paragraph" -->
+<script>
+  var reportConfig = { threshold: 12, label: "내부용 텍스트처럼 보일 수 있는 문자열" };
+  if (reportConfig.threshold < 20) { console.log("ok"); }
+</script>
+<style>
+  .kpi-card { border: 1px solid #ccc; } /* 이 텍스트도 편집 대상이 아니어야 함 */
+</style>

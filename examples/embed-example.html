@@ -17,11 +17,12 @@
   and which elements become editable. Swap this content for a real document — nothing about the
   editor cares what's above the marker block.</p>
 
-  <p>Any element matched by wz-editor's default selector (headings, paragraphs, list items, table
-  cells, and a handful of report-style content classes — see <code>DEFAULT_EDIT_SEL</code> in
-  <code>wz-editor.js</code>) becomes <code>contenteditable</code> once you unlock edit mode. Set
-  <code>editableSelector</code> in the config below to override that heuristic for your own
-  document's class names.</p>
+  <p>By default, wz-editor is a <strong>generic editor</strong> — every element that holds visible
+  text on the page becomes <code>contenteditable</code> once you unlock edit mode, with no
+  per-document selector to maintain. It only skips its own UI chrome and non-visual containers
+  (<code>script</code>/<code>style</code>/<code>template</code>). Set <code>editableSelector</code>
+  in the config below to a CSS selector if you want to restrict editing to a hand-picked set of
+  elements instead (advanced, opt-in).</p>
 
   <ul>
     <li>Click the pencil icon in the top-right corner.</li>
@@ -36,8 +37,8 @@
   </ul>
 
   <div class="callout">
-    This callout paragraph is editable too — it matches the <code>.callout</code> class in the
-    default selector list.
+    This callout paragraph is editable too — with the generic default, any text-bearing element on
+    the page is, regardless of its class name.
   </div>
 
   <!-- wz-editor:start -->

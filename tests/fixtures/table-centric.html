@@ -1,0 +1,51 @@
+<!-- Fixture 3: table-heavy document -- tr/td/th/caption. tr itself must NOT become an editable
+     (it has no direct text of its own once whitespace-only text nodes between <td>s are excluded);
+     each cell is its own editable, and caption is its own editable. -->
+<table>
+  <caption>2026년 프로젝트별 이슈 현황</caption>
+  <thead>
+    <tr>
+      <th>프로젝트</th>
+      <th>신규</th>
+      <th>해결</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Issue Dashboard</td>
+      <td>12</td>
+      <td>9</td>
+    </tr>
+    <tr>
+      <td>QA Workflow</td>
+      <td>7</td>
+      <td>7</td>
+    </tr>
+    <tr>
+      <td>혼합 셀: <b>강조</b> 텍스트</td>
+      <td>3</td>
+      <td>1</td>
+    </tr>
+  </tbody>
+  <tfoot>
+    <tr>
+      <!-- Real-doc empirical finding (stepA_universal, verified against a copy of
+           Report/public/Etc/token_usage_report_2026-06-07.html in a live browser): a cell whose
+           ENTIRE text is wrapped in a single child (no direct text of the <td>'s own) ends up with
+           <b> -- not <td> -- as the outermost element holding that text, since <td> itself has no
+           own direct text node to seed collection from. The text is still fully captured (just
+           hosted one level deeper); this is intended outermost-wins behavior, not omission. -->
+      <td><b>합계</b></td>
+      <td>22</td>
+      <td>17</td>
+    </tr>
+  </tfoot>
+</table>
+
+<div class="wz-draft-banner">
+  <span>복구 가능한 임시 저장본이 있습니다</span>
+</div>
+
+<style>
+table { border-collapse: collapse; } /* td { content: "가짜"; } 같은 텍스트도 대상이 아니어야 함 */
+</style>

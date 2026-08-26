@@ -1,0 +1,35 @@
+<!-- Fixture 4: unnamed div/span "card" layout -- no semantic tags, no meaningful class names (unlike
+     fixture 1's report classes). Wrapper divs that hold ONLY nested elements (no direct text of
+     their own) must NOT become editable; a wrapper div that DOES have direct text alongside a
+     nested element must win as the single (outermost) editable for that mixed content. -->
+<div class="grid">
+  <div class="cell">
+    <div>
+      <h4>알림</h4>
+      <p>새 항목이 3건 등록되었습니다.</p>
+    </div>
+  </div>
+  <div class="cell">
+    <div>
+      <h4>경고</h4>
+      <p>디스크 사용량이 90%를 초과했습니다.</p>
+    </div>
+  </div>
+  <div class="cell">
+    <!-- mixed content: this div itself has direct text ("상태: ") AND a nested <span> with its own
+         text ("정상") -- outermost-wins means only the div is editable, not the span. -->
+    <div>상태: <span>정상</span></div>
+  </div>
+  <div class="cell">
+    <span>담당자</span>
+    <span>홍길동</span>
+  </div>
+</div>
+
+<div class="wz-edit-fab">
+  <div>
+    <span>편집 아이콘</span>
+  </div>
+</div>
+
+<script>var cardCount = 4;</script>

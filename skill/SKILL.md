@@ -3,7 +3,7 @@ name: textfix
 description: "HTML로 만든 문서에 간단한 인페이지 '편집툴'을 붙여주는 스킬 — 붙이면 브라우저에서 연필 아이콘을 눌러 비밀번호를 입력하고 그 자리에서 텍스트를 직접 고쳐 GitLab 또는 GitHub 커밋으로 저장할 수 있다. 사용법: '/textfix' 실행 후 편집 기능을 붙일 HTML 문서의 로컬 경로나 GitLab/GitHub URL을 알려주면 된다. 탈착은 '/textfix --detach <경로>'. 트리거: 'HTML에 편집 기능 붙여줘', '문서 직접 편집 가능하게', '편집 버튼 달아줘', 'textfix', '인페이지 편집 추가', 경로/URL 제시 + '편집 기능/편집 가능하게' 조합, 탈착은 '편집 기능 떼줘/제거해줘'."
 user_invocable: true
 auto_trigger: true
-version: 0.1.0
+version: 0.2.0
 ---
 
 <!--
@@ -11,16 +11,21 @@ version: 0.1.0
   루트 경로를 가리킨다. Claude Code 플러그인으로 패키징해 설치했다면 그 환경이 제공하는
   플러그인 루트 변수로 치환하고, 이 저장소를 프로젝트에 그대로 복사해 두었다면 그 복사
   경로를 직접 대입한다. 실물 파일 위치: `<TEXTFIX_ROOT>/wz-editor.js`,
-  `<TEXTFIX_ROOT>/tools/encrypt-token.mjs`.
+  `<TEXTFIX_ROOT>/tools/encrypt-token.mjs`, `<TEXTFIX_ROOT>/tools/embed-lint.mjs`.
 -->
 
 # textfix — 인페이지 편집 기능 부착/탈착
 
 정적 HTML 문서에 `wz-editor` 모듈(비밀번호 게이트 + contenteditable 편집 +
-리치텍스트 미니 툴바 + localStorage 자동 초안 + GitLab Files API 커밋 저장 +
-취소/저장-후-자동종료)을 마커 블록 하나로 부착하거나, 그 블록만 제거해
-완전히 원복한다. 외부 의존성 0, 단일 파일 — 모듈 자체 설계는
+리치텍스트 미니 툴바 + localStorage 자동 초안 + GitLab/GitHub Files API 커밋 저장 +
+저장 후 실배포 추적 배너 + 취소/저장-후-자동종료)을 마커 블록 하나로 부착하거나,
+그 블록만 제거해 완전히 원복한다. 외부 의존성 0, 단일 파일 — 모듈 자체 설계는
 `<TEXTFIX_ROOT>/wz-editor.js` 상단 주석 참조.
+
+편집 대상은 문서별로 지정하지 않는다 — 기본값은 **범용 편집**이다: 페이지 안에서
+보이는 텍스트를 가진 요소는 전부 자동으로 편집 대상이 된다(편집기 자신의 UI와
+`script`/`style`/`template`만 제외). 특정 요소만 편집 가능하게 좁히려면 config의
+`editableSelector`에 CSS 셀렉터를 넣어 override한다(고급, 기본은 `null`).
 
 ## 절대 원칙
 
@@ -114,10 +119,14 @@ version: 0.1.0
      성공한다 — 새 비밀번호를 원하면 토큰도 새로 암호화해야 함을 사용자에게
      고지).
    - 기존 임베드가 없으면, provider별로 토큰을 발급받게 안내한다:
-     - **GitLab**: 프로젝트 → Settings → Access Tokens에서 발급
-       (권장 role: **Developer**, scope: `api`, 만료일 설정 권장).
-       Developer면 Files API 커밋은 가능하되 CI/CD 변수 열람 권한이 없어
-       토큰 유출 시 피해 범위가 좁다.
+     - **GitLab**: 프로젝트 → Settings → Access Tokens에서 발급.
+       대상 브랜치가 **protected**(보통 `main`)면 role은 **Maintainer 필수**
+       — Developer 토큰은 저장 시 `400 You are not allowed to push into this
+       branch`로 실패한다(실측 확인). protected가 아니면 Developer도 가능하나
+       Maintainer를 권장한다. scope는 **`api` 하나만** 체크 — 저장이 REST
+       API(`/repository/files`, `/commits`) 경유라 `api`가 필요하고
+       `write_repository`(git-over-HTTP 전용)는 불필요·불충분하다. 만료일
+       설정을 권장한다.
      - **GitHub**: Settings → Developer settings → Personal access tokens.
        fine-grained PAT면 대상 레포에 **Contents: Read and write** 권한만,
        classic이면 `repo` scope. 만료일 설정 권장.
@@ -198,7 +207,15 @@ version: 0.1.0
 
 ## Step 5. 검증
 
-1. 로컬에서 `python -m http.server --bind 127.0.0.1 <port>` (또는 동등 도구)로
+1. **기계 게이트 — `embed-lint`** (브라우저 열기 전에 먼저):
+   ```bash
+   node "<TEXTFIX_ROOT>/tools/embed-lint.mjs" <부착한 HTML 경로>
+   ```
+   `tokenCipherB64` 존재, host가 `https://`, `allowedHosts`에 host의 **origin**
+   (`new URL(host).origin` — hostname만 넣으면 검증 실패로 FAB 자체가 안 뜬다)
+   포함, `<script src>` 실물 파일 존재 4가지를 assert한다. FAIL이면 브라우저를
+   열기 전에 config를 수정한다.
+2. 로컬에서 `python -m http.server --bind 127.0.0.1 <port>` (또는 동등 도구)로
    대상 디렉터리를 서빙하고(0.0.0.0 전체 바인드 금지 — 암호문 config가 든 레포가
    LAN에 노출된다), 부착한 HTML을 브라우저(Claude Browser MCP 등)로 열어 확인:
    - 우측 상단 연필 아이콘(FAB)이 보이는가
@@ -206,9 +223,19 @@ version: 0.1.0
    - 편집모드에서 텍스트 수정 → 저장 시 토스트/에러가 예상대로 뜨는가
      (부착 검증 단계에선 placeholder 토큰이라 저장이 실패 토스트로 끝나는 것이
      정상 — 실토큰은 실제 배포 시 주입)
-2. `git diff`로 실제 삽입된 내용이 마커 블록(`<!-- wz-editor:start -->`~
+   - 저장 성공 시 화면에 **배포 상태 배너**가 뜨는지 확인한다 — 커밋 직후
+     "배포 중" 상태로 시작해, GitLab 파이프라인 또는 GitHub 커밋 상태 API를
+     폴링해 성공/실패로 갱신된다(폴링은 성공/실패 확정 시 또는 시도 예산
+     소진 시 멈추고, 네트워크 오류가 나도 편집 흐름을 막지 않는다 — 항상
+     "pending"으로 물러날 뿐 예외를 던지지 않는다).
+   - 저장 직후 아직 배포가 반영되기 전에 **같은 문서를 다시 편집 진입**해보고,
+     "방금 저장한 내용이 아직 배포되지 않았습니다" 같은 재진입 경고가 뜨는지
+     확인한다(직전 저장 기록이 15분 이내이고 배포 상태가 아직 pending으로
+     확인될 때만 경고 — 오래된 기록이나 상태 불명 시에는 경고하지 않는 안전
+     편향).
+3. `git diff`로 실제 삽입된 내용이 마커 블록(`<!-- wz-editor:start -->`~
    `<!-- wz-editor:end -->`)뿐인지 확인한다 — 기존 콘텐츠 무손상 검증.
-3. 커밋/푸시는 **사용자 확인 후에만** 진행한다(저장소에 대한 쓰기 작업이므로
+4. 커밋/푸시는 **사용자 확인 후에만** 진행한다(저장소에 대한 쓰기 작업이므로
    명시적 동의 필요).
 
 ## Step 6. 탈착
@@ -239,6 +266,14 @@ version: 0.1.0
 - 편집 초안(localStorage)은 7일 후 자동 만료된다. GitLab/GitHub Pages가 path
   공유 도메인이면 같은 호스트의 다른 프로젝트가 초안을 읽을 수 있으므로,
   unique-domain(프로젝트별 하위 도메인) 배포를 권장한다.
+- wz-editor가 브라우저에 남기는 데이터는 전부 **localStorage**(문서가 열린
+  사이트 origin에 귀속, 서버·레포·다른 사이트로 전송되지 않음) 한정이며 두
+  종류다: ① 위에서 설명한 **임시 초안**, ② 문서당 1개(~100바이트)인
+  **최근 저장 기록**(`{문서 경로, 커밋 SHA, 시각}`만 — 저장 직후 아직 배포가
+  반영되기 전에 같은 문서를 다시 편집하려 할 때의 재진입 경고 판단용, 사용자가
+  직접 열람하는 용도는 아니다). 최근 저장 기록은 15분이 지나거나 원격에서
+  새 커밋이 감지되면 자동 삭제되어 계속 쌓이지 않으며, 토큰·비밀번호는 두
+  종류 어디에도 저장되지 않는다.
 
 ## 산출물 경로 요약
 
@@ -246,3 +281,4 @@ version: 0.1.0
 |------|------|
 | wz-editor 모듈 실물 | `<TEXTFIX_ROOT>/wz-editor.js` (부착 시 대상 레포로 복사) |
 | 토큰 암호화 도구 | `<TEXTFIX_ROOT>/tools/encrypt-token.mjs` |
+| 부착 검증 게이트 | `<TEXTFIX_ROOT>/tools/embed-lint.mjs` |

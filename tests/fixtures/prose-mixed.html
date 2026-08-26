@@ -1,0 +1,35 @@
+<!-- Fixture 2: ordinary prose document, no report-specific classes at all -- the exact "다른 문서에서
+     편집 안 되는" case this refactor targets. Includes required mixed-content cases: a paragraph
+     with a trailing inline element AND trailing text after it, and a blockquote with strong/em/a. -->
+<article>
+  <h1>왜 문서마다 편집 셀렉터를 따로 지정해야 했는가</h1>
+  <p>기존 편집기는 특정 문서의 클래스 이름을 하드코딩하고 있었기 때문에, 다른 구조로 작성된 문서에
+    붙이면 <strong>텍스트 대부분이 편집되지 않는</strong> 문제가 있었다.</p>
+  <p>예를 들어 이 문단은 <span>중첩된 span</span> 꼬리 텍스트를 포함한다.</p>
+  <blockquote>
+    "<em>일반화된 수집 로직</em>이 있어야 어떤 문서에도 그대로 붙일 수 있다" — <a href="#src">출처</a>
+  </blockquote>
+  <h2>대안 설계</h2>
+  <p>TreeWalker로 텍스트 노드를 순회하고, 그 부모 엘리먼트를 편집 대상으로 삼는다. 다만
+    <a href="https://example.com">링크 텍스트</a>처럼 인라인 요소로 감싸인 부분까지 각각 별도
+    편집 영역으로 쪼개면 편집 경험이 나빠지므로, 바깥쪽 엘리먼트 하나만 편집 대상으로 남긴다.</p>
+  <ul>
+    <li>장점: 문서 구조에 의존하지 않는다</li>
+    <li>단점: <b>과도하게 큰 컨테이너</b>가 통째로 편집 대상이 될 수 있다</li>
+  </ul>
+</article>
+
+<div class="wz-pw-modal-overlay">
+  <div class="wz-pw-modal-box">
+    <div class="wz-pw-modal-title">비밀번호 입력</div>
+  </div>
+</div>
+<div class="wz-save-toast">저장되었습니다</div>
+
+<noscript><p>이 브라우저는 JavaScript를 지원하지 않습니다.</p></noscript>
+<template id="tpl-row"><tr><td>템플릿 행 텍스트</td></tr></template>
+
+<script>
+  document.title = "prose fixture";
+  // 스크립트 안의 문자열도 편집 대상이 아니어야 한다: <p>가짜 태그</p>
+</script>

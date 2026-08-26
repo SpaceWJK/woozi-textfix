@@ -5,7 +5,9 @@
  *
  * ===== Usage =====
  *   node encrypt-token.mjs --token-file <path to a file containing the token> --password-stdin
+ *   node encrypt-token.mjs --token-env <NAME of an env var holding the token> --password-stdin
  *   (then type/paste the edit password and press Enter on stdin)
+ *   --token-file and --token-env are mutually exclusive; exactly one is required.
  *
  * Example (interactive):
  *   node encrypt-token.mjs --token-file "C:\Users\me\Desktop\token.txt" --password-stdin
@@ -14,11 +16,27 @@
  * Example (piped, e.g. from a password manager CLI — never from a literal in your shell history):
  *   your-pw-manager-cli get "wz-editor edit password" | node encrypt-token.mjs --token-file token.txt --password-stdin
  *
+ * Example (--token-env, for automated/scripted callers that already hold the token in an env var
+ * and cannot write it to a file first — see design principle #1 below for why this exists):
+ *   TOKEN=glpat-xxxx node encrypt-token.mjs --token-env TOKEN --password-stdin
+ *
  * ===== Design principles (security) =====
- * 1. The token is only ever read from the file given via --token-file. It is never accepted
- *    via argv or an environment variable — that closes off the exposure path where a process
- *    listing / command-line inspection (ps, Get-CimInstance Win32_Process, etc.) would leak the
- *    plaintext token.
+ * 1. The token value is never accepted via argv — that closes off the exposure path where a
+ *    process listing / command-line inspection (ps, Get-CimInstance Win32_Process, wmic, etc.)
+ *    would leak the plaintext token. It is accepted one of two ways: a file path (--token-file,
+ *    the caller reads the token from disk beforehand) or an environment VARIABLE NAME
+ *    (--token-env, only the *name* travels on argv — never the value; this script reads the
+ *    actual token from process.env[NAME] itself). --token-env exists because some automated
+ *    callers (e.g. a skill that must not write a secret to a temp file, and cannot use a shell
+ *    command like `printenv TOKEN > file` to get it into one either — that command is itself
+ *    hard-blocked by this repo's bash-guard env-var-bulk-dump/echo-printf-secret-env rules)
+ *    already hold the token in an environment variable and have no safe path to a file. A
+ *    process's *environment* is not exposed by the same inspection surface that leaks argv (ps/
+ *    wmic/Get-CimInstance list command lines, not environment blocks), so --token-env has a
+ *    narrower exposure surface than passing the token itself as an argv value would, even though
+ *    it is not as narrow as --token-file's (a compromised process on the same machine with
+ *    permission to read another process's environment block — e.g. /proc/<pid>/environ on Linux,
+ *    or an administrator on Windows — still could; a plain `ps`/`Get-CimInstance` listing cannot).
  * 2. F-4: the edit password is only ever accepted via --password-stdin (read from stdin, one
  *    line). It is no longer accepted as a positional argv value — argv is visible to any other
  *    process on the machine via a process listing, and (unlike the token, which lives only in a
@@ -47,18 +65,36 @@ import fs from 'node:fs';
 
 function fail(msg) {
   console.error('[encrypt-token] ' + msg);
-  console.error('Usage: node encrypt-token.mjs --token-file <path to token file> --password-stdin');
+  console.error('Usage: node encrypt-token.mjs (--token-file <path to token file> | --token-env <NAME of an env var holding the token>) --password-stdin');
   console.error('  (the edit password is read from stdin, one line, after launch)');
   process.exit(1);
 }
 
 function parseArgs(argv) {
   const tfIdx = argv.indexOf('--token-file');
-  if (tfIdx === -1) fail('--token-file is required.');
-  const tokenFile = argv[tfIdx + 1];
-  if (!tokenFile) fail('--token-file requires a path argument.');
+  const teIdx = argv.indexOf('--token-env');
+  if (tfIdx !== -1 && teIdx !== -1) {
+    fail('--token-file and --token-env are mutually exclusive — pass exactly one.');
+  }
+  if (tfIdx === -1 && teIdx === -1) {
+    fail('One of --token-file or --token-env is required.');
+  }
 
-  const rest = argv.filter((_, i) => i !== tfIdx && i !== tfIdx + 1);
+  let tokenSource;
+  let consumedIdx;
+  if (tfIdx !== -1) {
+    const tokenFile = argv[tfIdx + 1];
+    if (!tokenFile) fail('--token-file requires a path argument.');
+    tokenSource = { kind: 'file', tokenFile };
+    consumedIdx = tfIdx;
+  } else {
+    const tokenEnvName = argv[teIdx + 1];
+    if (!tokenEnvName) fail('--token-env requires an environment variable NAME argument (not the token value itself).');
+    tokenSource = { kind: 'env', tokenEnvName };
+    consumedIdx = teIdx;
+  }
+
+  const rest = argv.filter((_, i) => i !== consumedIdx && i !== consumedIdx + 1);
 
   // F-4: the password must come from stdin, never from argv (a process listing on this machine
   // can read argv of any process — a positional password argument leaks the same way the token
@@ -73,7 +109,7 @@ function parseArgs(argv) {
     fail('Unexpected extra argument(s): ' + leftover.join(' ') + ' — the password is read from stdin only, not passed on the command line.');
   }
 
-  return { tokenFile };
+  return tokenSource;
 }
 
 function readTokenFile(path) {
@@ -85,6 +121,18 @@ function readTokenFile(path) {
   }
   const token = raw.replace(/\r?\n$/, '').trim();
   if (!token) fail('Token file is empty: ' + path);
+  return token;
+}
+
+function readTokenFromEnv(varName) {
+  // Only varName (a NAME, not a secret) ever appears in argv/logs here. The actual value is read
+  // directly from this process's own environment — never printed, never echoed back.
+  const raw = process.env[varName];
+  if (raw === undefined) {
+    fail('Environment variable ' + varName + ' is not set. Set it before invoking (e.g. `export ' + varName + '=<token>` / `$env:' + varName + '=\'<token>\'`), then pass --token-env ' + varName + ' — never pass the token value itself as an argument.');
+  }
+  const token = raw.replace(/\r?\n$/, '').trim();
+  if (!token) fail('Environment variable ' + varName + ' is empty.');
   return token;
 }
 
@@ -134,8 +182,10 @@ function encrypt(token, password) {
 }
 
 function main() {
-  const { tokenFile } = parseArgs(process.argv.slice(2));
-  const token = readTokenFile(tokenFile);
+  const tokenSource = parseArgs(process.argv.slice(2));
+  const token = tokenSource.kind === 'file'
+    ? readTokenFile(tokenSource.tokenFile)
+    : readTokenFromEnv(tokenSource.tokenEnvName);
   const password = readPasswordFromStdin();
   warnIfWeakPassword(password);
   const { saltB64, ivB64, ciphertextB64 } = encrypt(token, password);
@@ -145,7 +195,11 @@ function main() {
   console.log("tokenIvB64: '" + ivB64 + "',");
   console.log("tokenCipherB64: '" + ciphertextB64 + "',");
   console.error('');
-  console.error('[encrypt-token] Done. Delete the file you passed via --token-file (' + tokenFile + ') now.');
+  if (tokenSource.kind === 'file') {
+    console.error('[encrypt-token] Done. Delete the file you passed via --token-file (' + tokenSource.tokenFile + ') now.');
+  } else {
+    console.error('[encrypt-token] Done. Unset the environment variable ' + tokenSource.tokenEnvName + ' now (e.g. `unset ' + tokenSource.tokenEnvName + '` / `Remove-Item Env:' + tokenSource.tokenEnvName + '`) so it does not linger in this shell session.');
+  }
 }
 
 main();

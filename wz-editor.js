@@ -17,7 +17,9 @@
  *       tokenIvB64: '<output of tools/encrypt-token.mjs>',
  *       tokenCipherB64: '<output of tools/encrypt-token.mjs>',   // required -- see below
  *       // allowedHosts: ['https://gitlab.example.com']  // optional: restrict gitlabHost to this origin allowlist
- *       editableSelector: null   // null = module's default heuristic; set a CSS selector to override
+ *       editableSelector: null   // null = generic default (every element holding visible text is
+*                                 // editable, document-agnostic); set a CSS selector to restrict
+*                                 // editing to a hand-picked selector instead (legacy behavior)
  *     };
  *   </script>
  *   <script src="assets/js/wz-editor.js"></script>
@@ -61,6 +63,15 @@
   var DRAFT_KEY = 'wzEditorDraft::' + (GITLAB_FILE_PATH || location.pathname);
   var SAVE_MERGE_WINDOW_MS = 60000;
   var DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // R-3: stale local drafts older than 7 days are dropped, not restored.
+  // stepA2_deploy_ux: same key-namespacing convention as DRAFT_KEY above (prefix + '::' + doc path) --
+  // Master's hygiene rule explicitly requires this rather than an ad hoc key name. Stores ONLY
+  // {docPath, sha, ts} (see serializeLastSaveRecord/parseLastSaveRecord below) -- never a token,
+  // password, or any edited content; that stays exclusively in DRAFT_KEY's own payload, which this
+  // is deliberately kept separate from.
+  var LAST_SAVE_KEY = 'wzEditorLastSave::' + (GITLAB_FILE_PATH || location.pathname);
+  var LAST_SAVE_STALE_WINDOW_MS = 15 * 60 * 1000; // Master's 15-minute re-entry-guard window
+  var DEPLOY_POLL_INTERVAL_MS = 10000;
+  var DEPLOY_POLL_MAX_ATTEMPTS = 30; // 10s * 30 = 5 minutes, matching the design's polling budget
 
   // Storage backend provider selection. Explicit CFG.provider wins; otherwise infer from
   // whichever host-ish config value was given, so existing GitLab embeds (no provider field)
@@ -135,15 +146,19 @@
     console.warn('[wz-editor] WZ_EDITOR_CONFIG has a real token but no allowedHosts allowlist — recommended to pin allowedHosts (an array of allowed origins) so a modified/compromised embed cannot redirect the decrypted token to an attacker-controlled host.');
   }
 
-  // Default heuristic tuned to this kind of document's content classes — based on the design
-  // token class names of the reference report this module was originally built against. When
-  // attaching to a different document, override via config.editableSelector.
-  var DEFAULT_EDIT_SEL = 'h1, h2, .page-title, .page-sub, .page-eyebrow, .section-label, .cover .lead, .cover .tag, '
-    + 'p, li, td, th, .kpi-desc, .kpi-label, .kpi-value, .insight-title, .insight-body, .insight-tag, '
-    + '.step-title, .step-time, .step-desc, .tl-step, .tl-q, .tl-result, .tl-learn, .tl-badge, .card h4, '
-    + '.callout, .conclusion-label, .conclusion-body';
-  var EDIT_SEL = CFG.editableSelector || DEFAULT_EDIT_SEL;
-  var EXCLUDE_ANCESTOR_SEL = '.wz-edit-toolbar, .wz-pw-modal-overlay, .wz-draft-banner, .wz-save-toast, .wz-edit-fab';
+  // Default collection is now a generic heuristic (collectEditablesHeuristic below): it walks every
+  // visible, non-whitespace text node in the document and edits at the outermost element that holds
+  // it, so any document becomes fully editable with no per-document class list required. Set
+  // config.editableSelector to opt back into the old fixed-selector behavior (kept for backward
+  // compat with existing embeds that already rely on a hand-picked selector).
+  var OVERRIDE_EDIT_SEL = CFG.editableSelector || null;
+  var EXCLUDE_ANCESTOR_SEL = '.wz-edit-toolbar, .wz-pw-modal-overlay, .wz-draft-banner, .wz-save-toast, .wz-edit-fab, .wz-status-banner';
+  // Never treated as editable (selector-override path or heuristic path alike): a script/style body
+  // is not user-visible prose, and a <template>'s content is inert markup, not rendered content.
+  var STRUCTURAL_EXCLUDE_SEL = 'script, style, noscript, template';
+  // OVERLAP_SEL: retained as-is (task scope: leave alone when unused) -- grep across this file finds
+  // no reader of this variable, so it predates something that no longer exists rather than being a
+  // hidden dependency of the heuristic above.
   var OVERLAP_SEL = 'tr, td, th, .img-caption, .callout, .tl-result, .tl-learn, .tl-q, p, li, .kpi-desc, .insight-body, .dt-track, .subblock-title';
 
   // ===================================================================
@@ -250,6 +265,39 @@
     + '.wz-save-toast.active{opacity:1;visibility:visible;}'
     + '.wz-save-toast.wz-save-toast-warn{background:#c2410c;}'
 
+    // stepA2_deploy_ux: one shared persistent top banner, reused for both the post-save
+    // deploy-status tracker (no action buttons, just an evolving status line) and the stale
+    // self-save re-entry guard (two action buttons) -- the two never need to be visible at the same
+    // time (see startDeployStatusPolling / evaluateReentryGuardAndProceed: the guard only runs when
+    // THIS tab did NOT just perform the save that's still being tracked), so one component with
+    // variant classes/toggleable buttons is simpler than two near-identical ones.
+    + '.wz-status-banner{position:fixed;top:0;left:0;right:0;z-index:260;display:none;align-items:center;gap:14px;flex-wrap:wrap;'
+    + '  padding:10px 20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;border-bottom:2px solid transparent;}'
+    + '.wz-status-banner.active{display:flex;}'
+    + 'body.wz-status-banner-active{padding-top:64px;}' // real, wrap-aware value set inline by measureAndSetStatusBannerPadding()
+    + '.wz-status-banner-text{font-size:13px;font-weight:700;flex:1;}'
+    + '.wz-status-banner-actions{display:flex;gap:8px;margin-left:auto;align-items:center;}'
+    + '.wz-status-banner-btn{padding:5px 14px;border-radius:6px;font-size:12.5px;font-weight:700;cursor:pointer;border:1px solid transparent;background:#fff;}'
+    + '.wz-status-banner-btn-close{padding:2px 8px;font-size:14px;line-height:1;background:transparent;border:none;color:inherit;opacity:.7;}'
+    + '.wz-status-banner-btn-close:hover{opacity:1;}'
+    // pending (deploy in progress): blue-toned informational.
+    + '.wz-status-banner-pending{background:#eff6ff;border-bottom-color:#2563eb;}'
+    + '.wz-status-banner-pending .wz-status-banner-text{color:#1d4ed8;}'
+    // success (deploy confirmed live): green-toned confirmation.
+    + '.wz-status-banner-success{background:#f0fdf4;border-bottom-color:#15803d;}'
+    + '.wz-status-banner-success .wz-status-banner-text{color:#15803d;}'
+    // fallback (failed/timeout/unknown -- never blocks, just asks for patience): neutral gray.
+    + '.wz-status-banner-fallback{background:#f4f4f5;border-bottom-color:#71717a;}'
+    + '.wz-status-banner-fallback .wz-status-banner-text{color:#3f3f46;}'
+    // guard (stale self-save re-entry prompt): same orange tone as the draft banner -- both are
+    // "pay attention before you edit" prompts.
+    + '.wz-status-banner-guard{background:#fff7ed;border-bottom-color:#c2410c;}'
+    + '.wz-status-banner-guard .wz-status-banner-text{color:#c2410c;}'
+    + '.wz-status-banner-guard .wz-status-banner-btn{border-color:#c2410c;color:#c2410c;}'
+    + '.wz-status-banner-guard .wz-status-banner-btn-override{background:#c2410c;color:#fff;}'
+    + '.wz-status-banner-guard .wz-status-banner-btn-override:hover{background:#9a3412;}'
+    + '.wz-status-banner-guard .wz-status-banner-btn-refresh:hover{background:#fff7ed;}'
+
     + '[data-wz-editable="true"]{outline:1px dashed transparent;outline-offset:3px;border-radius:3px;}'
     + 'body.wz-edit-mode [data-wz-editable="true"]{outline-color:#7aa8e0;cursor:text;}'
     + 'body.wz-edit-mode [data-wz-editable="true"]:hover{outline-color:#2563eb;}'
@@ -335,7 +383,16 @@
     + '  </div>'
     + '</div>'
 
-    + '<div class="wz-save-toast" id="wzSaveToast"></div>';
+    + '<div class="wz-save-toast" id="wzSaveToast"></div>'
+
+    + '<div class="wz-status-banner" id="wzStatusBanner" role="status" aria-live="polite">'
+    + '  <span class="wz-status-banner-text" id="wzStatusBannerText"></span>'
+    + '  <div class="wz-status-banner-actions">'
+    + '    <button type="button" class="wz-status-banner-btn wz-status-banner-btn-refresh" id="wzStatusBannerRefreshBtn" style="display:none">새로고침</button>'
+    + '    <button type="button" class="wz-status-banner-btn wz-status-banner-btn-override" id="wzStatusBannerOverrideBtn" style="display:none">그래도 편집</button>'
+    + '    <button type="button" class="wz-status-banner-btn-close" id="wzStatusBannerCloseBtn" aria-label="배너 닫기" title="닫기">×</button>'
+    + '  </div>'
+    + '</div>';
 
   document.body.insertAdjacentHTML('beforeend', HTML);
 
@@ -357,6 +414,11 @@
   var draftRestoreBtn = document.getElementById('wzDraftRestoreBtn');
   var draftDiscardBtn = document.getElementById('wzDraftDiscardBtn');
   var saveToastEl = document.getElementById('wzSaveToast');
+  var statusBannerEl = document.getElementById('wzStatusBanner');
+  var statusBannerTextEl = document.getElementById('wzStatusBannerText');
+  var statusBannerRefreshBtn = document.getElementById('wzStatusBannerRefreshBtn');
+  var statusBannerOverrideBtn = document.getElementById('wzStatusBannerOverrideBtn');
+  var statusBannerCloseBtn = document.getElementById('wzStatusBannerCloseBtn');
 
   var editableEls = [];
   var origInnerMap = new Map();
@@ -388,16 +450,40 @@
   function base64ToUtf8(b64){
     return decodeURIComponent(escape(atob(b64.replace(/\s/g, ''))));
   }
+  // Best-effort extraction of a human-readable reason from a failed provider API response, so the
+  // save-failure toast can say WHY (e.g. "A file with this name doesn't exist") instead of only a
+  // bare status code -- without that, diagnosing a 400 has meant reproducing the request with curl
+  // by hand. Deliberately narrow, per the "A:" status-only decision this refines rather than
+  // reverses: the risk that decision was guarding against is the FULL response body (which can
+  // carry things like the literal repo path) landing verbatim in a user-facing toast. This only ever
+  // surfaces the JSON body's own `message` string field -- GitLab and GitHub error responses both
+  // use exactly this shape ({"message": "..."}) -- length-capped and control-character-stripped, and
+  // treats any other shape (non-JSON body, no message field, non-string message) as nothing safe to
+  // show rather than trying to hand-sanitize a wider surface.
+  async function extractErrorHint(res){
+    try {
+      var text = await res.text();
+      if (!text) return '';
+      var body;
+      try { body = JSON.parse(text); } catch (e) { return ''; } // non-JSON error page -- nothing safe to extract
+      var msg = (body && typeof body.message === 'string') ? body.message : '';
+      if (!msg) return '';
+      msg = msg.replace(/[\r\n\t]+/g, ' ').trim();
+      if (msg.length > 160) msg = msg.slice(0, 160) + '…';
+      return msg ? (' — ' + msg) : '';
+    } catch (e) {
+      return ''; // e.g. body already consumed/network hiccup mid-read -- degrade to status-only
+    }
+  }
   async function fetchLatestGitLab(token){
     var url = GITLAB_HOST + '/api/v4/projects/' + encodeURIComponent(GITLAB_PROJECT_PATH)
       + '/repository/files/' + encodeURIComponent(GITLAB_FILE_PATH) + '/raw?ref=' + encodeURIComponent(GITLAB_BRANCH);
     var res = await fetch(url, {headers: {'PRIVATE-TOKEN': token}, cache: 'no-store'});
-    // A: status code only -- the response body (error JSON from the provider) is never read into
-    // the throw message. It would otherwise surface verbatim in the user-facing save-failure
-    // toast, and provider error bodies are not guaranteed to be free of details we don't want
-    // echoed back into the page (or logged wherever that toast text ends up).
+    // A (narrowed, see extractErrorHint above): the status code is always shown; only a narrow
+    // `message` string field (never the raw body) is appended as a hint when the provider sent one.
     if (!res.ok){
-      throw new Error('원본 최신본 조회 실패 (GitLab API ' + res.status + ')');
+      var hint = await extractErrorHint(res);
+      throw new Error('원본 최신본 조회 실패 (GitLab API ' + res.status + ')' + hint);
     }
     return {html: await res.text(), sha: null}; // GitLab's Files API has no sha-on-update requirement.
   }
@@ -413,7 +499,8 @@
       cache: 'no-store'
     });
     if (!res.ok){
-      throw new Error('원본 최신본 조회 실패 (GitHub API ' + res.status + ')'); // A: status only, see fetchLatestGitLab's comment above.
+      var hint = await extractErrorHint(res); // A (narrowed): see fetchLatestGitLab's comment above.
+      throw new Error('원본 최신본 조회 실패 (GitHub API ' + res.status + ')' + hint);
     }
     var json = await res.json();
     // m-3: GitHub's contents API returns an *array* (no .content field) when filePath resolves to a
@@ -436,15 +523,72 @@
     return PROVIDER === 'github' ? fetchLatestGitHub(token) : fetchLatestGitLab(token);
   }
 
-  function collectEditablesFrom(root){
-    var all = Array.prototype.slice.call(root.querySelectorAll(EDIT_SEL));
+  // Selector-based collection -- only used when config.editableSelector is explicitly set. Kept
+  // byte-for-byte equivalent to the pre-heuristic behavior: querySelectorAll against the given
+  // selector, drop anything nested under the editor's own UI, then drop anything nested under
+  // another surviving candidate (a hand-picked selector list is usually already the level the
+  // author wants edited, e.g. 'td' rather than 'tr', so containment here is a safety net rather
+  // than the load-bearing mixed-content rule the heuristic below relies on).
+  function collectEditablesBySelector(root, selector){
+    var all = Array.prototype.slice.call(root.querySelectorAll(selector));
     all = all.filter(function(el){ return !el.closest(EXCLUDE_ANCESTOR_SEL); });
     return all.filter(function(el){
       return !all.some(function(other){ return other !== el && el.contains(other); });
     });
   }
+  // Generic default collection: any element that directly holds visible (non-whitespace) text,
+  // across an arbitrary document -- no per-document class list required. Walks every text node via
+  // TreeWalker (document order, so the result and origInnerMap/index-based diffing downstream stay
+  // stable and reproducible across the two independent collection passes -- live DOM here,
+  // re-parsed-from-source in buildEditedSource -- that a save round-trips through) and resolves each
+  // to its nearest element ancestor (parentElement). The result then collapses to the OUTERMOST
+  // element per branch: unlike the selector path above, mixed content (an element with both direct
+  // text and a nested element that also has direct text, e.g. `<p>lead <span>tail</span></p>`) must
+  // keep the outer element as the single edit target -- editing only the inner element would either
+  // orphan the outer element's own text (no editable host left for it) or split one semantic unit of
+  // prose across two independently-saved contenteditable regions.
+  function collectEditablesHeuristic(root){
+    var doc = (root && root.nodeType === 9) ? root : ((root && root.ownerDocument) || document);
+    var walkRoot = (root && root.nodeType === 9 && root.body) ? root.body : root;
+    if (!walkRoot || !doc.createTreeWalker) return [];
+    var walker = doc.createTreeWalker(walkRoot, NodeFilter.SHOW_TEXT);
+    var seen = [];
+    var warnedBareBody = false;
+    var node;
+    while ((node = walker.nextNode())) {
+      if (!node.nodeValue || !/\S/.test(node.nodeValue)) continue; // whitespace-only text node
+      var el = node.parentElement;
+      if (!el) continue;
+      var tagLower = (el.tagName || '').toLowerCase();
+      // Rare: a stray text node with no wrapping element at all (a direct child of <body>/<html>).
+      // There is no element to attach contenteditable to without altering document structure, so
+      // this text is left un-editable rather than silently promoting body/html itself (which would
+      // make the ENTIRE page a single edit region). Surfaced once per collection pass so it is not
+      // a silent gap.
+      if (tagLower === 'body' || tagLower === 'html') {
+        if (!warnedBareBody) {
+          console.warn('[wz-editor] a bare text node directly under <' + tagLower + '> has no wrapping element and was skipped -- wrap it (e.g. in a <p>) to make it editable.');
+          warnedBareBody = true;
+        }
+        continue;
+      }
+      if (el.closest(STRUCTURAL_EXCLUDE_SEL)) continue; // inside script/style/noscript/template
+      if (el.closest(EXCLUDE_ANCESTOR_SEL)) continue;    // inside the editor's own UI chrome
+      if (seen.indexOf(el) === -1) seen.push(el);
+    }
+    // Outermost-wins: drop any collected element that is itself nested inside another collected
+    // element -- see the function comment above for why (mixed-content containment).
+    return seen.filter(function(el){
+      return !seen.some(function(other){ return other !== el && other.contains(el); });
+    });
+  }
+  function collectEditablesFrom(root, overrideSelector){
+    return overrideSelector
+      ? collectEditablesBySelector(root, overrideSelector)
+      : collectEditablesHeuristic(root);
+  }
   function collectEditables(){
-    editableEls = collectEditablesFrom(document);
+    editableEls = collectEditablesFrom(document, OVERRIDE_EDIT_SEL);
     origInnerMap.clear(); // C1: full reset, not just overwrite -- avoids stale idx keys surviving a re-collect onto a shorter list.
     editableEls.forEach(function(el, idx){ origInnerMap.set(idx, el.innerHTML); });
   }
@@ -628,6 +772,7 @@
     document.addEventListener('paste', onEditablePaste, true);
     document.addEventListener('drop', onEditableDrop, true);
     hideDraftBanner(); // clears any banner-driven padding-top before we set the toolbar's own.
+    hideStatusBanner(); // stepA2_deploy_ux: same reason -- a deploy-status/guard banner is also fixed-to-top.
     measureAndSetToolbarPadding();
     window.addEventListener('resize', measureAndSetToolbarPadding);
   }
@@ -674,7 +819,7 @@
     e.preventDefault();
     insertSanitizedHtmlOrText(host, e.dataTransfer);
   }
-  editFab.addEventListener('click', function(){ requireAuth(function(){ collectEditables(); enterEditMode(null); }); });
+  editFab.addEventListener('click', function(){ requireAuth(evaluateReentryGuardAndProceed); });
 
   editCancelBtn.addEventListener('click', function(){
     // m-2: the button being visually/functionally disabled during isSaving (toggled in doSave)
@@ -836,8 +981,269 @@
   });
   showDraftBannerIfAny();
 
+  // ---------------------------------------------------------------------------------------------
+  // stepA2_deploy_ux: deploy-status tracking + stale self-save re-entry guard.
+  //
+  // Master's real-usage finding: save (commit) succeeds immediately, but the GitLab Pages
+  // deployment that actually serves the page takes 1-2 minutes to catch up. A user who saves, then
+  // reloads the page before that deploy finishes, sees the OLD (pre-edit) content and assumes the
+  // save failed -- so they re-edit and re-save, which then fails with a "someone else edited this"
+  // conflict error that is actually just their own prior save, not yet visible to them.
+  //
+  // Pure decision functions first (no DOM/localStorage/fetch access -- independently testable, see
+  // tests/deploy-guard.test.mjs), then the thin impure wrappers that touch localStorage/network.
+  // ---------------------------------------------------------------------------------------------
+  function parseLastSaveRecord(raw){
+    if (!raw) return null;
+    var obj;
+    try { obj = JSON.parse(raw); } catch (e) { return null; }
+    if (!obj || typeof obj.docPath !== 'string' || typeof obj.sha !== 'string' || typeof obj.ts !== 'number') return null;
+    return { docPath: obj.docPath, sha: obj.sha, ts: obj.ts };
+  }
+  function serializeLastSaveRecord(docPath, sha, ts){
+    return JSON.stringify({ docPath: docPath, sha: sha, ts: ts });
+  }
+  // Master's hygiene rule 2: a record older than the 15-minute window is never used as a live
+  // guard signal and is pruned on next access.
+  function isLastSaveRecordStaleByAge(record, nowMs, windowMs){
+    return !record || (nowMs - record.ts) > windowMs;
+  }
+  // A record is "mismatched" once the remote branch HEAD has moved past the sha it names (someone
+  // else committed, or the document has simply moved on). remoteSha === null means this could not
+  // be determined (a network hiccup) -- that must NOT be treated as a mismatch: pruning a
+  // possibly-still-valid record on an unknown is worse than leaving it in place one more access.
+  function isLastSaveRecordMismatched(record, remoteSha){
+    return !!(record && remoteSha && remoteSha !== record.sha);
+  }
+  // Composite prune decision -- age OR remote-mismatch (Master's hygiene rule 2, verbatim: "15분
+  // 경과 기록, 원격 sha가 기록과 달라진 기록은 다음 접근 시 즉시 삭제"). One record per document
+  // (LAST_SAVE_KEY is itself scoped per doc path) and overwritten on every save, never appended, so
+  // there is no separate "cap the accumulated count" step needed beyond this prune-on-access rule.
+  function shouldPruneLastSaveRecord(record, nowMs, remoteSha, windowMs){
+    if (!record) return false;
+    return isLastSaveRecordStaleByAge(record, nowMs, windowMs) || isLastSaveRecordMismatched(record, remoteSha);
+  }
+  // GitLab's `GET .../pipelines?sha=` -- pipelinesJson is the raw parsed JSON body (or anything
+  // falsy/wrong-shaped, from a network hiccup or an unexpected response). Collapsed to the same
+  // 3-state model as the GitHub mapper below so the poller/gate logic never has to branch on
+  // provider itself.
+  function mapGitLabPipelinesToDeployStatus(pipelinesJson){
+    if (!Array.isArray(pipelinesJson) || pipelinesJson.length === 0) return 'pending'; // no pipeline yet -- keep waiting, not a failure
+    var status = pipelinesJson[0] && pipelinesJson[0].status;
+    if (status === 'success') return 'success';
+    if (status === 'failed' || status === 'canceled') return 'failed';
+    return 'pending'; // running/pending/created/manual/... and anything unrecognized
+  }
+  // GitHub's `GET .../commits/{sha}/status` -- statusJson.state is one of success/failure/error/pending.
+  function mapGitHubCommitStatusToDeployStatus(statusJson){
+    var state = statusJson && statusJson.state;
+    if (state === 'success') return 'success';
+    if (state === 'failure' || state === 'error') return 'failed';
+    return 'pending';
+  }
+  // Whether to show the "your own save may not have propagated to this page yet" prompt before
+  // entering edit mode again. Biased toward NOT warning when uncertain (Master's explicit "과판정
+  // 보다 미판정이 안전" instruction): only a CONFIRMED 'pending' deploy status for our own
+  // last-saved sha triggers it. 'success' (already live -- safe to edit) and 'failed' (waiting
+  // longer will never make it live -- warning would mislead) both stay silent and let the user
+  // proceed normally; any resulting conflict still gets the friendlier "이전 화면에서 편집 중"
+  // wording via isConflictAgainstOwnRecentSave below.
+  function shouldWarnBeforeReentry(record, deployStatus){
+    return !!record && deployStatus === 'pending';
+  }
+  // Design item 3: at save-conflict time, decide whether the conflict is against the user's OWN
+  // immediately-prior save (friendlier, points at the real cause) vs. an actually different edit
+  // from elsewhere (the original wording).
+  function isConflictAgainstOwnRecentSave(record, remoteHeadSha){
+    return !!(record && remoteHeadSha && record.sha === remoteHeadSha);
+  }
+  // Poller termination -- stop on a confirmed terminal state, or once the attempt budget is spent
+  // (timeout). Never stops on 'pending' before that budget runs out.
+  function shouldStopPolling(status, attempts, maxAttempts){
+    return status === 'success' || status === 'failed' || attempts >= maxAttempts;
+  }
+
+  function readLastSaveRecord(){
+    return parseLastSaveRecord(localStorage.getItem(LAST_SAVE_KEY));
+  }
+  function writeLastSaveRecord(sha){
+    var docPath = GITLAB_FILE_PATH || location.pathname;
+    localStorage.setItem(LAST_SAVE_KEY, serializeLastSaveRecord(docPath, sha, Date.now()));
+  }
+  function clearLastSaveRecord(){
+    localStorage.removeItem(LAST_SAVE_KEY);
+  }
+  // Resolves the current HEAD commit sha of GITLAB_BRANCH. Used both to detect "someone else (or a
+  // different state) has since moved past my last-saved sha" (re-entry guard, save-conflict
+  // wording) and, for GitLab specifically, to learn the sha of the commit doSave() itself just made
+  // (GitLab's Files API PUT response carries no sha; GitHub's Contents API PUT response does, via
+  // commitResult.commit.sha, so doSave() only falls back to this for GitLab).
+  async function fetchLatestCommitSha(token){
+    try {
+      var url, res, json;
+      if (PROVIDER === 'github') {
+        url = API_BASE + '/repos/' + GITLAB_PROJECT_PATH + '/commits/' + encodeURIComponent(GITLAB_BRANCH);
+        res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, cache: 'no-store' });
+      } else {
+        url = GITLAB_HOST + '/api/v4/projects/' + encodeURIComponent(GITLAB_PROJECT_PATH) + '/repository/commits/' + encodeURIComponent(GITLAB_BRANCH);
+        res = await fetch(url, { headers: { 'PRIVATE-TOKEN': token }, cache: 'no-store' });
+      }
+      if (!res.ok) return null;
+      json = await res.json();
+      return (json && (json.sha || json.id)) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+  // GitLab side verified against this tool's own real project (see stepA2_deploy_ux_result.md).
+  // GitHub side could NOT be exercised against a real GitHub Pages deployment in this environment --
+  // implemented against GitHub's documented commit-status API shape only, not live-verified.
+  async function checkDeployStatus(sha, token){
+    try {
+      var url, res, json;
+      if (PROVIDER === 'github') {
+        url = API_BASE + '/repos/' + GITLAB_PROJECT_PATH + '/commits/' + encodeURIComponent(sha) + '/status';
+        res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, cache: 'no-store' });
+        if (!res.ok) return 'pending';
+        json = await res.json();
+        return mapGitHubCommitStatusToDeployStatus(json);
+      }
+      url = GITLAB_HOST + '/api/v4/projects/' + encodeURIComponent(GITLAB_PROJECT_PATH) + '/pipelines?sha=' + encodeURIComponent(sha);
+      res = await fetch(url, { headers: { 'PRIVATE-TOKEN': token }, cache: 'no-store' });
+      if (!res.ok) return 'pending';
+      json = await res.json();
+      return mapGitLabPipelinesToDeployStatus(json);
+    } catch (e) {
+      return 'pending';
+    }
+  }
+
+  // Shared banner UI (see the CSS comment on .wz-status-banner for why one component covers both
+  // the deploy-status tracker and the re-entry guard prompt).
+  var statusBannerOverrideHandler = null;
+  function measureAndSetStatusBannerPadding(){
+    var h = statusBannerEl ? statusBannerEl.offsetHeight : 0;
+    document.body.style.paddingTop = h ? (h + 4) + 'px' : '';
+  }
+  function showStatusBanner(opts){
+    hideDraftBanner(); // the two are both fixed-to-top;  never stack them.
+    statusBannerTextEl.textContent = opts.text;
+    statusBannerEl.className = 'wz-status-banner active' + (opts.variantClass ? ' ' + opts.variantClass : '');
+    statusBannerRefreshBtn.style.display = opts.showRefresh ? '' : 'none';
+    statusBannerOverrideBtn.style.display = opts.showOverride ? '' : 'none';
+    statusBannerOverrideHandler = opts.onOverride || null;
+    // M-U: a banner offering real choices (re-entry guard) is an interruption worth an assertive
+    // announcement; a passive status update (deploy tracker) should not interrupt a screen-reader
+    // user mid-task the same way -- polite is enough there.
+    statusBannerEl.setAttribute('role', (opts.showRefresh || opts.showOverride) ? 'alert' : 'status');
+    statusBannerEl.setAttribute('aria-live', (opts.showRefresh || opts.showOverride) ? 'assertive' : 'polite');
+    document.body.classList.add('wz-status-banner-active');
+    measureAndSetStatusBannerPadding();
+    window.addEventListener('resize', measureAndSetStatusBannerPadding);
+  }
+  function hideStatusBanner(){
+    statusBannerEl.classList.remove('active');
+    document.body.classList.remove('wz-status-banner-active');
+    window.removeEventListener('resize', measureAndSetStatusBannerPadding);
+    document.body.style.paddingTop = '';
+    statusBannerOverrideHandler = null;
+  }
+  statusBannerCloseBtn.addEventListener('click', hideStatusBanner);
+  statusBannerRefreshBtn.addEventListener('click', function(){ location.reload(); });
+  statusBannerOverrideBtn.addEventListener('click', function(){
+    var handler = statusBannerOverrideHandler;
+    hideStatusBanner();
+    if (handler) handler();
+  });
+
+  // Poll generation counter: starting a new poll (a subsequent save) invalidates any older
+  // in-flight poll loop -- it checks its own captured generation before touching the banner or
+  // scheduling its next tick, so a superseded poll silently no-ops instead of two polls fighting
+  // over the same banner.
+  var deployPollGeneration = 0;
+  var deployPollTimer = null;
+  function startDeployStatusPolling(sha){
+    var myGen = ++deployPollGeneration;
+    clearTimeout(deployPollTimer);
+    // Local copy of the already-decrypted session token (F-1) -- reused for every poll tick, then
+    // dereferenced (set to null) the moment this poll loop ends, per Master's instruction. This
+    // does NOT touch the shared `cachedToken` closure var itself (that stays live for the rest of
+    // the tab session, unrelated to this poll's own lifetime).
+    var pollToken = cachedToken;
+    var attempts = 0;
+    var shortSha = sha ? sha.slice(0, 8) : '?';
+    showStatusBanner({
+      text: '✓ 저장 완료 (커밋 ' + shortSha + ') — 사이트 반영 중…',
+      variantClass: 'wz-status-banner-pending'
+    });
+    function finish(finalStatus){
+      if (finalStatus === 'success'){
+        showStatusBanner({ text: '✓ 반영 완료 (커밋 ' + shortSha + ') — 새로고침해도 유지됩니다', variantClass: 'wz-status-banner-success' });
+      } else {
+        // failed / timeout / any other non-success terminal outcome -- same wording either way:
+        // never presented as an error, never blocks further editing.
+        showStatusBanner({ text: '반영 상태 확인 불가 — 1~2분 후 새로고침 해주세요 (커밋 ' + shortSha + ')', variantClass: 'wz-status-banner-fallback' });
+      }
+      pollToken = null; // release the token reference now that polling is done
+    }
+    function tick(){
+      if (myGen !== deployPollGeneration) { pollToken = null; return; } // superseded by a newer save
+      attempts++;
+      checkDeployStatus(sha, pollToken).then(function(status){
+        if (myGen !== deployPollGeneration) { pollToken = null; return; }
+        if (shouldStopPolling(status, attempts, DEPLOY_POLL_MAX_ATTEMPTS)){ finish(status); return; }
+        deployPollTimer = setTimeout(tick, DEPLOY_POLL_INTERVAL_MS);
+      });
+    }
+    tick();
+  }
+
+  // stepA2_deploy_ux design deviation, noted deliberately (see stepA2_deploy_ux_result.md): the
+  // brief describes this check as running "FAB 클릭 시(비번 모달 전)" (before the password modal),
+  // but checking the remote commit/pipeline state needs an authenticated token, which does not
+  // exist yet before the password is entered -- especially right after the very page reload this
+  // guard exists to catch, which drops the in-memory cachedToken/editPassword entirely. So this
+  // runs as the FIRST thing inside requireAuth's onReady callback instead: still strictly before
+  // collectEditables()/enterEditMode(), i.e. still before the user starts re-typing anything.
+  async function evaluateReentryGuardAndProceed(){
+    // Continuing to edit in the SAME tab session that made the last save is always safe -- doSave()
+    // already re-baselines editableEls/origInnerMap against the post-commit DOM right after
+    // committing (see the C1 comment in doSave), so there is no stale-baseline risk to guard
+    // against here. lastSaveWasThisTabSession is a plain in-memory flag (never persisted), so it is
+    // true only for the tab that actually performed the save and false again after any reload --
+    // exactly the same reload boundary the bug itself depends on.
+    if (lastSaveWasThisTabSession) { collectEditables(); enterEditMode(null); return; }
+    var nowMs = Date.now();
+    var record = readLastSaveRecord();
+    if (!record || isLastSaveRecordStaleByAge(record, nowMs, LAST_SAVE_STALE_WINDOW_MS)){
+      if (record) clearLastSaveRecord();
+      collectEditables(); enterEditMode(null);
+      return;
+    }
+    var token = cachedToken;
+    var headSha = await fetchLatestCommitSha(token);
+    if (isLastSaveRecordMismatched(record, headSha)){
+      clearLastSaveRecord();
+      collectEditables(); enterEditMode(null);
+      return;
+    }
+    var status = await checkDeployStatus(record.sha, token);
+    if (shouldWarnBeforeReentry(record, status)){
+      showStatusBanner({
+        text: '방금 저장한 버전이 아직 이 화면에 반영되지 않았습니다 (배포 중). 반영 완료 후 새로고침해서 편집하세요.',
+        variantClass: 'wz-status-banner-guard',
+        showRefresh: true,
+        showOverride: true,
+        onOverride: function(){ collectEditables(); enterEditMode(null); }
+      });
+    } else {
+      collectEditables(); enterEditMode(null);
+    }
+  }
+
   // ---------- Save (double-submit guard + DOM-index-matched diff + GitLab commit) ----------
   var isSaving = false, pendingSaveQueued = false, pendingSaveTimer = null, lastCommitAt = 0;
+  var lastSaveWasThisTabSession = false; // stepA2_deploy_ux -- see evaluateReentryGuardAndProceed above
   function setToast(msg){ editToast.textContent = msg; }
   var saveToastTimer = null;
   function showSaveToast(msg, durationMs, isWarn){
@@ -887,7 +1293,7 @@
   function buildEditedSource(sourceHtml){
     var parser = new DOMParser();
     var doc = parser.parseFromString(sourceHtml, 'text/html');
-    var origCandidates = collectEditablesFrom(doc);
+    var origCandidates = collectEditablesFrom(doc, OVERRIDE_EDIT_SEL);
     var structuralDrift = (origCandidates.length !== editableEls.length);
     var changedCount = 0, mismatchCount = 0, touchedCount = 0;
     var handlerLeakFound = false;
@@ -953,9 +1359,10 @@
         commit_message: commitMessage || 'report: in-page edit'
       })
     });
-    // A: status only -- see fetchLatestGitLab's comment above (same reasoning for the commit path).
+    // A (narrowed): see fetchLatestGitLab's comment above (same reasoning for the commit path).
     if (!res.ok){
-      throw new Error('GitLab API ' + res.status);
+      var hint = await extractErrorHint(res);
+      throw new Error('GitLab API ' + res.status + hint);
     }
     return res.json();
   }
@@ -977,7 +1384,8 @@
       })
     });
     if (!res.ok){
-      throw new Error('GitHub API ' + res.status); // A: status only.
+      var hint = await extractErrorHint(res); // A (narrowed): see fetchLatestGitLab's comment above.
+      throw new Error('GitHub API ' + res.status + hint);
     }
     return res.json();
   }
@@ -1017,9 +1425,21 @@
         // this editing session (someone else's commit, or a same-count reorder) since this session's
         // baseline was captured -- that is a genuine multi-editor collision, not a structure change,
         // and deserves its own wording so the user understands why a plain refresh+redo is needed.
-        var conflictMsg = diff.structuralDrift
-          ? ('반영 불가 ' + diff.mismatchCount + '건 — 원본 문서 구조(요소 개수)가 변경되어 편집을 안전하게 반영할 수 없습니다(커밋 중단). 새로고침 후 다시 편집해 주세요.')
-          : ('다른 곳에서 이 문서가 수정되어(편집 충돌) 안전하게 반영할 수 없습니다 — 새로고침 후 다시 편집해 주세요. (충돌 ' + diff.mismatchCount + '건)');
+        var conflictMsg;
+        if (diff.structuralDrift) {
+          conflictMsg = '반영 불가 ' + diff.mismatchCount + '건 — 원본 문서 구조(요소 개수)가 변경되어 편집을 안전하게 반영할 수 없습니다(커밋 중단). 새로고침 후 다시 편집해 주세요.';
+        } else {
+          // stepA2_deploy_ux design item 3: distinguish "you conflicted with your own very recent
+          // save" (friendlier wording, points at the real cause -- Pages/CDN deploy lag, not a
+          // rival editor) from a genuine third-party edit. remoteHeadSha reuses the same
+          // commit-sha lookup the deploy-status poller/re-entry guard use; a failed lookup (it
+          // never throws -- see fetchLatestCommitSha) just falls back to the original wording.
+          var remoteHeadSha = await fetchLatestCommitSha(token);
+          var lastSave = readLastSaveRecord();
+          conflictMsg = isConflictAgainstOwnRecentSave(lastSave, remoteHeadSha)
+            ? ('이전 화면에서 편집 중입니다 — 방금 저장한 최신 버전이 반영된 후 새로고침해서 다시 편집해 주세요. (충돌 ' + diff.mismatchCount + '건)')
+            : ('다른 곳에서 이 문서가 수정되어(편집 충돌) 안전하게 반영할 수 없습니다 — 새로고침 후 다시 편집해 주세요. (충돌 ' + diff.mismatchCount + '건)');
+        }
         throw new Error(conflictMsg);
       }
       if (diff.leaked.length){
@@ -1029,7 +1449,7 @@
       // P3-4: optional user-entered commit memo (sanitizeCommitMessage strips newlines/control chars
       // and caps length; falls back to the module's default message when empty).
       var commitMsg = sanitizeCommitMessage(commitMsgInput ? commitMsgInput.value : '');
-      await commitFile(diff.html, token, latest.sha, commitMsg);
+      var commitResult = await commitFile(diff.html, token, latest.sha, commitMsg);
       lastCommitAt = Date.now();
       localStorage.removeItem(DRAFT_KEY);
       // C1: re-baseline against the now-committed DOM state. Without this, origInnerMap stays
@@ -1043,8 +1463,21 @@
       var isPartial = diff.changedCount < diff.touchedCount;
       var successMsg = '저장됨 — 사이트 반영까지 1~2분(파이프라인). 반영 ' + diff.changedCount + '건 / 전체 편집 ' + diff.touchedCount + '건';
       setToast(successMsg);
+      // stepA2_deploy_ux: edit mode ends but the edited DOM itself is left exactly as-is (exitEditMode
+      // only strips contenteditable/data-wz-editable -- it never touches innerHTML), so the user
+      // keeps seeing their own edit in THIS tab regardless of Pages/CDN deploy lag.
       exitEditMode();
       showSaveToast(successMsg, 5000, isPartial);
+      // GitHub's Contents API PUT response already carries the new commit's sha (commitResult.commit.sha);
+      // GitLab's Files API PUT response does not, so fall back to a follow-up branch-HEAD read --
+      // safe under this tool's low-concurrency assumption that nothing else committed in the instant
+      // between our PUT succeeding and this read.
+      var deployedSha = (commitResult && commitResult.commit && commitResult.commit.sha) || await fetchLatestCommitSha(token);
+      if (deployedSha) {
+        writeLastSaveRecord(deployedSha);
+        lastSaveWasThisTabSession = true; // see evaluateReentryGuardAndProceed -- same-tab re-edit never needs the guard
+        startDeployStatusPolling(deployedSha);
+      }
     } catch(err){
       setToast('저장 실패: ' + (err && err.message ? err.message : '알 수 없는 오류') + ' (편집 내용은 유지됩니다)');
     } finally {

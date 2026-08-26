@@ -249,3 +249,292 @@ export function makeMiniDomSandbox() {
     NodeFilter: { SHOW_ELEMENT: 1 }
   };
 }
+
+// ---------------------------------------------------------------------------
+// stepA_universal (textfix-ux-redesign): extraction + mini-DOM for the generic default text-node
+// collection heuristic (collectEditablesBySelector / collectEditablesHeuristic /
+// collectEditablesFrom), added alongside makeMiniDomSandbox above rather than reusing it -- these
+// three functions need TreeWalker(SHOW_TEXT), Element.closest()/contains()/querySelectorAll() and
+// Text.parentElement, none of which the sanitizer sandbox's minimal DOM implements (and extending
+// that one risks the 14 sanitizer tests it already backs; a second, purpose-built mini-DOM is the
+// lower-risk path for a net-new test surface).
+// ---------------------------------------------------------------------------
+
+// Pulls the two selector-constant declarations (EXCLUDE_ANCESTOR_SEL, STRUCTURAL_EXCLUDE_SEL) and
+// the three collection functions out of wz-editor.js verbatim. None of the three functions close
+// over CFG/GITLAB_*/PROVIDER/token state -- they take `root`/`overrideSelector` as explicit
+// parameters -- so, like extractSanitizerModule, this is a self-contained, independently-runnable
+// slice of the real source.
+export function extractCollectModule(src) {
+  function grabConstLine(varName) {
+    const start = src.indexOf('var ' + varName);
+    if (start === -1) return null;
+    const semi = src.indexOf(';', start);
+    return semi === -1 ? null : src.slice(start, semi + 1);
+  }
+  const excludeAncestorLine = grabConstLine('EXCLUDE_ANCESTOR_SEL');
+  const structuralExcludeLine = grabConstLine('STRUCTURAL_EXCLUDE_SEL');
+  const bySelectorFn = extractBalanced(src, 'function collectEditablesBySelector(');
+  const heuristicFn = extractBalanced(src, 'function collectEditablesHeuristic(');
+  const dispatchFn = extractBalanced(src, 'function collectEditablesFrom(');
+  if (!(excludeAncestorLine && structuralExcludeLine && bySelectorFn && heuristicFn && dispatchFn)) {
+    throw new Error('One or more collection functions/constants not found in wz-editor.js -- extraction anchors may be stale');
+  }
+  return [excludeAncestorLine, structuralExcludeLine, bySelectorFn, heuristicFn, dispatchFn].join('\n');
+}
+
+// A second, independent hand-rolled DOM (see comment above for why this doesn't reuse
+// makeMiniDomSandbox). Supports just what collectEditablesFrom's two code paths need:
+//   - Document: nodeType 9, .body, .createTreeWalker(root, whatToShow)
+//   - Element: nodeType 1, tagName/localName, parentNode/parentElement, childNodes,
+//     closest(selectorList), contains(other), querySelectorAll(selectorList), getAttribute('class')
+//   - Text: nodeType 3, nodeValue, parentNode/parentElement
+// Selector support is intentionally narrow (bare tag name or a single ".class", comma-separated) --
+// that covers every selector the module itself ever passes in (EXCLUDE_ANCESTOR_SEL,
+// STRUCTURAL_EXCLUDE_SEL, and the simple override selectors this test suite uses), not arbitrary CSS.
+class MiniNode2 {
+  constructor(nodeType) { this.nodeType = nodeType; this.parentNode = null; }
+  get parentElement() { return this.parentNode; } // parentNode is always an Element or null in this tree (no fragments)
+}
+class MiniText2 extends MiniNode2 {
+  constructor(data) { super(3); this.nodeValue = data; }
+}
+class MiniElement2 extends MiniNode2 {
+  constructor(tagName) {
+    super(1);
+    this.localName = tagName.toLowerCase();
+    this.tagName = this.localName.toUpperCase();
+    this._attrs = new Map();
+    this.childNodes = [];
+  }
+  getAttribute(name) { const a = this._attrs.get(name.toLowerCase()); return a === undefined ? null : a; }
+  setAttribute(name, value) { this._attrs.set(name.toLowerCase(), String(value)); }
+  appendChild(node) { node.parentNode = this; this.childNodes.push(node); return node; }
+  matches(selectorList) {
+    return selectorList.split(',').map(s => s.trim()).filter(Boolean).some(sel => {
+      if (sel.startsWith('.')) {
+        const cls = sel.slice(1);
+        return (this.getAttribute('class') || '').split(/\s+/).filter(Boolean).includes(cls);
+      }
+      return this.localName === sel.toLowerCase();
+    });
+  }
+  closest(selectorList) {
+    let node = this;
+    while (node) {
+      if (node.nodeType === 1 && node.matches(selectorList)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+  contains(other) {
+    let node = other;
+    while (node) {
+      if (node === this) return true;
+      node = node.parentNode;
+    }
+    return false;
+  }
+  querySelectorAll(selectorList) {
+    const out = [];
+    (function rec(node) {
+      for (const child of node.childNodes) {
+        if (child.nodeType === 1) {
+          if (child.matches(selectorList)) out.push(child);
+          rec(child);
+        }
+      }
+    })(this);
+    return out;
+  }
+}
+
+// RAWTEXT_TAGS mirrors the HTML parsing spec's treatment of <script>/<style>: everything up to the
+// matching end tag is literal text, never tokenized as markup -- this matters here because a fixture
+// exercising STRUCTURAL_EXCLUDE_SEL needs a real Text child under <script>/<style> for
+// collectEditablesHeuristic's `el.closest('script, style, ...')` guard to actually be exercised
+// (rather than the test's own tokenizer accidentally doing the exclusion for it by choking on '<').
+const RAWTEXT_TAGS = { script: 1, style: 1 };
+const VOID_TAGS = { br: 1, img: 1, hr: 1, input: 1, meta: 1, link: 1, base: 1 };
+
+function findTagEnd2(html, gtSearchStart) {
+  let inQuote = null;
+  for (let i = gtSearchStart; i < html.length; i++) {
+    const c = html[i];
+    if (inQuote) { if (c === inQuote) inQuote = null; continue; }
+    if (c === '"' || c === '\'') { inQuote = c; continue; }
+    if (c === '>') return i;
+  }
+  return -1;
+}
+function parseAttrs2(el, attrStr) {
+  const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*(?:=\s*("([^"]*)"|'([^']*)'|[^\s"'>]+))?/g;
+  let am;
+  while ((am = attrRe.exec(attrStr))) {
+    const name = am[1];
+    const val = am[3] !== undefined ? am[3] : (am[4] !== undefined ? am[4] : (am[2] || ''));
+    el.setAttribute(name, val);
+  }
+}
+function parseChildren2(html, ownerParent) {
+  const stack = [{ children: [], owner: ownerParent }];
+  let pos = 0;
+  while (pos < html.length) {
+    const lt = html.indexOf('<', pos);
+    const top = stack[stack.length - 1];
+    if (lt === -1) {
+      if (pos < html.length) { const t = new MiniText2(html.slice(pos)); t.parentNode = top.owner; top.children.push(t); }
+      break;
+    }
+    if (lt > pos) { const t = new MiniText2(html.slice(pos, lt)); t.parentNode = top.owner; top.children.push(t); }
+    // HTML comments: skip entirely (real Comment nodes are nodeType 8 -- never SHOW_TEXT/SHOW_ELEMENT
+    // -- so simply not emitting a node for them is equivalent for this test harness's purposes).
+    // Must be checked before the tag-name match below: '<!--' has no letter right after '<', so
+    // without this it would fall into the "not a real tag" branch and get tokenized character-by-
+    // character as if it were markup, corrupting everything after it in the fixture.
+    if (html.startsWith('<!--', lt)) {
+      const endIdx = html.indexOf('-->', lt + 4);
+      pos = endIdx === -1 ? html.length : endIdx + 3;
+      continue;
+    }
+    const isClose = html[lt + 1] === '/';
+    const nameStart = isClose ? lt + 2 : lt + 1;
+    const nameMatch = /^[a-zA-Z][a-zA-Z0-9:-]*/.exec(html.slice(nameStart));
+    if (!nameMatch) { const t = new MiniText2('<'); t.parentNode = top.owner; top.children.push(t); pos = lt + 1; continue; }
+    const tag = nameMatch[0].toLowerCase();
+    const gt = findTagEnd2(html, nameStart + nameMatch[0].length);
+    if (gt === -1) { pos = html.length; break; }
+    if (isClose) {
+      for (let i = stack.length - 1; i > 0; i--) { if (stack[i].tag === tag) { stack.length = i; break; } }
+      pos = gt + 1;
+      continue;
+    }
+    const selfClosing = html[gt - 1] === '/';
+    const attrStr = html.slice(nameStart + nameMatch[0].length, selfClosing ? gt - 1 : gt);
+    const el = new MiniElement2(tag);
+    el.parentNode = top.owner;
+    parseAttrs2(el, attrStr);
+    top.children.push(el);
+    if (selfClosing || VOID_TAGS[tag]) { pos = gt + 1; continue; }
+    if (RAWTEXT_TAGS[tag]) {
+      // Raw text mode: consume verbatim up to (not including) the matching end tag, as one Text
+      // child -- no tag tokenization inside, matching the real HTML parser's <script>/<style> rule.
+      const endNeedle = '</' + tag;
+      const endIdx = html.toLowerCase().indexOf(endNeedle, gt + 1);
+      const rawEnd = endIdx === -1 ? html.length : endIdx;
+      const raw = html.slice(gt + 1, rawEnd);
+      if (raw) { const t = new MiniText2(raw); t.parentNode = el; el.childNodes.push(t); }
+      if (endIdx === -1) { pos = html.length; break; }
+      const closeGt = html.indexOf('>', endIdx);
+      pos = closeGt === -1 ? html.length : closeGt + 1;
+      continue;
+    }
+    stack.push({ tag, children: el.childNodes, owner: el });
+    pos = gt + 1;
+  }
+  return stack[0].children;
+}
+
+// Parses `html` as the innerHTML of a synthetic <body>, wrapped in a Document-shaped object
+// (nodeType 9, .body, .createTreeWalker) matching what both collectEditablesFrom call sites in
+// wz-editor.js actually receive (the live `document`, or a DOMParser-parsed Document).
+export function parseMiniDocument(html) {
+  const body = new MiniElement2('body');
+  body.childNodes = parseChildren2(html, body);
+  function collectInOrder(root, whatToShow) {
+    const out = [];
+    (function rec(node) {
+      for (const child of node.childNodes) {
+        const bit = child.nodeType === 1 ? 1 : (child.nodeType === 3 ? 4 : 0);
+        if ((whatToShow & bit) !== 0) out.push(child);
+        if (child.nodeType === 1) rec(child);
+      }
+    })(root);
+    return out;
+  }
+  return {
+    nodeType: 9,
+    body,
+    // Real Document.querySelectorAll searches the whole document (documentElement down); here
+    // that's simply "delegate to body", matching what collectEditablesBySelector's
+    // `root.querySelectorAll(selector)` call needs when `root` is this Document shim.
+    querySelectorAll(selectorList) { return body.querySelectorAll(selectorList); },
+    createTreeWalker(root, whatToShow) {
+      const nodes = collectInOrder(root, whatToShow);
+      let idx = -1;
+      return { nextNode() { idx++; return idx < nodes.length ? nodes[idx] : null; } };
+    }
+  };
+}
+
+export const COLLECT_NODE_FILTER = { SHOW_ELEMENT: 1, SHOW_TEXT: 4 };
+
+// ---------------------------------------------------------------------------
+// stepA2_deploy_ux: extraction for the deploy-status tracking + stale self-save re-entry guard.
+// ---------------------------------------------------------------------------
+
+// The 10 pure decision functions -- zero external dependencies (no CFG/GITLAB_*/PROVIDER/DOM), so
+// this is a self-contained, independently-runnable slice of the real source, same as
+// extractSanitizerModule/extractCollectModule above.
+export function extractDeployGuardPureModule(src) {
+  const names = [
+    'parseLastSaveRecord', 'serializeLastSaveRecord', 'isLastSaveRecordStaleByAge',
+    'isLastSaveRecordMismatched', 'shouldPruneLastSaveRecord', 'mapGitLabPipelinesToDeployStatus',
+    'mapGitHubCommitStatusToDeployStatus', 'shouldWarnBeforeReentry', 'isConflictAgainstOwnRecentSave',
+    'shouldStopPolling'
+  ];
+  const parts = names.map(name => {
+    const fn = extractBalanced(src, 'function ' + name + '(');
+    if (!fn) throw new Error('function ' + name + ' not found in wz-editor.js -- extraction anchor may be stale');
+    return fn;
+  });
+  return parts.join('\n');
+}
+
+// fetchLatestCommitSha / checkDeployStatus -- these close over PROVIDER/API_BASE/GITLAB_HOST/
+// GITLAB_PROJECT_PATH/GITLAB_BRANCH/fetch, none of which exist standalone, so (matching the old
+// scratchpad test-github-provider.mjs technique) the sandbox provides those as plain preset values
+// rather than this extracting their `var X = CFG.x || ...` declaration lines (CFG itself doesn't
+// exist outside the real module init). Also pulls in the two status-mapper pure functions, since
+// checkDeployStatus calls them directly.
+export function extractDeployNetworkModule(src) {
+  const mapGitLabFn = extractBalanced(src, 'function mapGitLabPipelinesToDeployStatus(');
+  const mapGitHubFn = extractBalanced(src, 'function mapGitHubCommitStatusToDeployStatus(');
+  const fetchShaFn = extractBalanced(src, 'async function fetchLatestCommitSha(');
+  const checkStatusFn = extractBalanced(src, 'async function checkDeployStatus(');
+  if (!(mapGitLabFn && mapGitHubFn && fetchShaFn && checkStatusFn)) {
+    throw new Error('One or more deploy-network functions not found in wz-editor.js -- extraction anchors may be stale');
+  }
+  return [mapGitLabFn, mapGitHubFn, fetchShaFn, checkStatusFn].join('\n');
+}
+
+// readLastSaveRecord / writeLastSaveRecord / clearLastSaveRecord -- close over LAST_SAVE_KEY (whose
+// own declaration line closes over GITLAB_FILE_PATH/location, provided as sandbox presets, same
+// reasoning as extractDeployNetworkModule above) and localStorage/Date (provided by the sandbox).
+export function extractDeployStorageModule(src) {
+  const start = src.indexOf('var LAST_SAVE_KEY');
+  if (start === -1) throw new Error('LAST_SAVE_KEY declaration not found in wz-editor.js');
+  const keyLine = src.slice(start, src.indexOf(';', start) + 1);
+  const parseFn = extractBalanced(src, 'function parseLastSaveRecord(');
+  const serializeFn = extractBalanced(src, 'function serializeLastSaveRecord(');
+  const readFn = extractBalanced(src, 'function readLastSaveRecord(');
+  const writeFn = extractBalanced(src, 'function writeLastSaveRecord(');
+  const clearFn = extractBalanced(src, 'function clearLastSaveRecord(');
+  if (!(keyLine && parseFn && serializeFn && readFn && writeFn && clearFn)) {
+    throw new Error('One or more deploy-storage functions/constants not found in wz-editor.js -- extraction anchors may be stale');
+  }
+  return [keyLine, parseFn, serializeFn, readFn, writeFn, clearFn].join('\n');
+}
+
+// Minimal fake localStorage -- Node has no built-in Storage implementation available inside a
+// fresh vm context, and pulling in a package for it would violate the "zero external dependencies"
+// contract this whole test suite follows for wz-editor.js's own sake.
+export function makeFakeLocalStorage() {
+  const store = new Map();
+  return {
+    getItem(key) { return store.has(key) ? store.get(key) : null; },
+    setItem(key, value) { store.set(key, String(value)); },
+    removeItem(key) { store.delete(key); },
+    _dump() { return new Map(store); } // test-only introspection
+  };
+}
