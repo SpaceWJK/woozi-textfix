@@ -5,6 +5,45 @@
  * Zero external dependencies, single file, all CSS/HTML self-injected — can be attached to and
  * detached from any static HTML document.
  *
+ * v0.3: (1) focused editable elements gain a native CSS `resize` handle (:focus-scoped, never
+ *       inline CSS) so long text can widen horizontally. (2) toolbar "recent colors" swatch row
+ *       (localStorage `wz-recent-colors`, max 8, MRU order) for one-click reapply of a previously
+ *       used text color.
+ * v0.3.2 (real-doc incidents, 2026-08-31):
+ *       (a) design pivot for the resize feature -- Master's real intent is that a deliberate
+ *       horizontal resize SURVIVES save, not that it snaps back on edit-mode exit. An element whose
+ *       width actually changed during the session now keeps `width:<px>; max-width:100%` (the 100%
+ *       cap, not `none`, so a fixed px width still yields to a narrower viewport/container instead
+ *       of overflowing it) and drops height (content-driven again); this is now also picked up by
+ *       buildEditedSource() as a real, committed change, not just a live-DOM-only effect. An
+ *       element that was never resized is unaffected -- still fully restored.
+ *       (b) Enter inside an editable region no longer triggers the browser's default block-split
+ *       (which was observed turning one real `<p class="para">` into `<p>+<div>+empty<p>`, losing
+ *       the class) -- Enter/Shift+Enter now always insert a plain `<br>` instead, so no keystroke
+ *       can change a host block element's tag/class/count.
+ * v0.3.3 (real-doc incident, 2026-08-31): v0.3.2 only applied the persisted `max-width:100%`
+ *       override in exitEditMode() -- too late. Moving focus to a DIFFERENT element mid-session (no
+ *       exit yet) already let the :focus-scoped override stop matching, so the document's own
+ *       max-width snapped back instantly on blur, well before exitEditMode() ever ran. Fixed by
+ *       applying the same `max-width:100%` the moment a resize is detected (on mouseup, compared
+ *       against the enterEditMode() snapshot) instead of waiting for session end -- an untouched
+ *       element is still never affected.
+ * v0.3.4 (Master real-doc policy, 2026-08-31): max-width:100% alone still isn't enough when the
+ *       containing block itself is too narrow to ever fit the target width (measured live against
+ *       czn: 1258px target vs. the container's own 1004px content width -- the element just clamps
+ *       to 1004px and visually looks reverted again). Policy: the CONTAINING BLOCK now grows to fit
+ *       a resize that genuinely can't fit, computed generically (walk the ancestor chain, raise
+ *       whichever ancestor's own max-width is the actual bottleneck, by exactly the box-sizing-aware
+ *       amount needed) rather than hardcoded to any one selector -- and this elevation is now also
+ *       replicated into the committed/saved document, not just the live tab.
+ * v0.3.5(B) (Master real-usage correction, 2026-08-31): Master's final call between two options --
+ *       "make focus-mode preview never widen anything" (A, tried and discarded the same day) vs.
+ *       "keep the wide focus-mode preview, and PERSIST it for whatever you actually edited" (B,
+ *       adopted). Any element whose TEXT CONTENT was changed this session (not just a dragged one)
+ *       now also gets `max-width:100%` on save/exit -- no explicit width, since a normal block
+ *       element already fills its container by default, reproducing the focus-mode look without
+ *       sacrificing responsiveness. A bare click with no edit still saves nothing (unchanged).
+ *
  * ===== Usage (embed block to add to the host document, 3-4 lines) =====
  *   <!-- wz-editor:start -->
  *   <script>
@@ -238,6 +277,12 @@
     + '.wz-fmt-color-btn{width:20px;height:20px;border-radius:50%;border:2px solid rgba(255,255,255,.5);cursor:pointer;padding:0;}'
     + '.wz-fmt-color-btn:hover{border-color:#fff;}'
     + '.wz-fmt-color-default{background:#2b2b2b;}'
+    // v0.3 feature 2: recent-colors swatch row -- same visual language as .wz-fmt-color-btn (small
+    // circle swatches) but rendered dynamically from localStorage, so no fixed count is baked into
+    // the HTML template below.
+    + '.wz-fmt-recent-colors{display:flex;gap:4px;align-items:center;flex-wrap:wrap;}'
+    + '.wz-fmt-recent-swatch{width:18px;height:18px;border-radius:50%;border:1.5px solid rgba(255,255,255,.5);cursor:pointer;padding:0;}'
+    + '.wz-fmt-recent-swatch:hover{border-color:#fff;}'
 
     // M-U3: every other injected bar (.wz-edit-toolbar, .wz-edit-format-bar) wraps at narrow widths
     // or 200% zoom except this one -- add flex-wrap so its text+actions reflow instead of
@@ -301,7 +346,28 @@
     + '[data-wz-editable="true"]{outline:1px dashed transparent;outline-offset:3px;border-radius:3px;}'
     + 'body.wz-edit-mode [data-wz-editable="true"]{outline-color:#7aa8e0;cursor:text;}'
     + 'body.wz-edit-mode [data-wz-editable="true"]:hover{outline-color:#2563eb;}'
-    + 'body.wz-edit-mode [data-wz-editable="true"]:focus{outline:2px solid #2563eb;background:rgba(59,130,246,.06);}';
+    // v0.3 feature 1: resize/overflow are applied ONLY via this :focus-scoped CSS rule -- never as an
+    // inline style -- so the currently-focused editable element gains a native browser resize handle
+    // (bottom-right corner) that lets it be widened horizontally instead of only wrapping vertically.
+    // Master's real-usage complaint was specifically "가로로는 못 넓힌다" -- resize:both (not
+    // horizontal-only) is used because CSS has no horizontal-only resize keyword; height dragging is
+    // an accepted side effect. Dragging still makes the BROWSER itself write explicit width/height
+    // directly onto the element's inline style -- that residue is stripped in exitEditMode() below so
+    // it never reaches the saved/committed document.
+    //
+    // v0.3 fix (Master real-doc regression, 2026-08-31): real deployed prose (e.g. `.sec p.para`)
+    // commonly sets its own `max-width` (a ch-based readable-line-length rule) for the NON-editing
+    // reading experience. CSS max-width still clamps the box's rendered width even after the resize
+    // handle sets a larger inline `width` -- so on those documents dragging the handle visibly did
+    // nothing (the drag "worked" in that el.style.width changed, but layout stayed capped at
+    // max-width). `max-width:none !important` lifts that cap for exactly as long as this element is
+    // focused/being resized; !important is required because a page's own `.sec p.para{max-width:76ch}`
+    // rule (or any higher-specificity host-page rule) must not out-rank this override. This is still
+    // pure :focus-scoped CSS -- never written into the element's own inline style or the saved
+    // document -- so it needs no separate cleanup in exitEditMode() (losing `[data-wz-editable]`
+    // already stops the selector from matching at all, the same way resize/overflow above do).
+    + 'body.wz-edit-mode [data-wz-editable="true"]:focus{outline:2px solid #2563eb;background:rgba(59,130,246,.06);'
+    + '  resize:both;overflow:auto;min-width:40px;min-height:1.4em;max-width:none !important;}';
 
   var styleEl = document.createElement('style');
   styleEl.setAttribute('data-wz-editor', 'true');
@@ -369,6 +435,9 @@
     + '    <button type="button" class="wz-fmt-color-btn" data-color="var(--gray-600)" style="background:var(--gray-600);" title="회색"></button>'
     + '    <button type="button" class="wz-fmt-color-btn wz-fmt-color-default" data-color="" title="기본(검정)"></button>'
     + '    <span class="wz-fmt-sep"></span>'
+    + '    <span class="wz-fmt-label">최근</span>'
+    + '    <div class="wz-fmt-recent-colors" id="wzFmtRecentColors" aria-label="최근 사용한 색상"></div>'
+    + '    <span class="wz-fmt-sep"></span>'
     + '    <button type="button" class="wz-fmt-btn" data-align="left" title="왼쪽 정렬">⇤</button>'
     + '    <button type="button" class="wz-fmt-btn" data-align="center" title="가운데 정렬">≡</button>'
     + '    <button type="button" class="wz-fmt-btn" data-align="right" title="오른쪽 정렬">⇥</button>'
@@ -422,6 +491,16 @@
 
   var editableEls = [];
   var origInnerMap = new Map();
+  // v0.3 feature 1: pre-edit-session width/height snapshot per element, captured in enterEditMode()
+  // and restored (not just blindly cleared) in exitEditMode() -- see the comments at both sites for
+  // why a plain strip would risk erasing a legitimate pre-existing inline size the document author
+  // set on purpose, which is not "editing-only" residue.
+  var origSizeMap = new WeakMap();
+  // v0.3.4 (Master real-doc policy, 2026-08-31): ancestors whose max-width we raised this session
+  // to accommodate a resize (see elevateConstrainingAncestors) -- consumed once by buildEditedSource()
+  // so the elevation also reaches the saved document, not just the live tab. Reset per edit session
+  // in enterEditMode() (one session = at most one save, per doSave()'s exitEditMode() call).
+  var elevatedAncestorEls = new Set();
   var pendingRecoverDraft = null;
   var editPassword = null;
   var cachedToken = null; // F-1: set on successful decrypt in submitPassword, reused by doSave so the password is decrypted only once per auth.
@@ -757,10 +836,15 @@
     document.body.style.paddingTop = h ? (h + 4) + 'px' : '';
   }
   function enterEditMode(draftToApply){
+    elevatedAncestorEls.clear(); // v0.3.4: fresh per edit session -- see its declaration comment above.
     document.body.classList.add('wz-edit-mode');
     editableEls.forEach(function(el, idx){
       el.setAttribute('contenteditable', 'true');
       el.setAttribute('data-wz-editable', 'true');
+      // v0.3 feature 1: snapshot whatever width/height this element already had (possibly none, but
+      // possibly a legitimate author-set inline size) BEFORE this edit session's focus-scoped resize
+      // handle can overwrite it via drag -- exitEditMode() restores exactly this, not just ''.
+      origSizeMap.set(el, {width: el.style.width, height: el.style.height});
       // F-2 sink 2/3: a restored draft comes from localStorage, which any same-origin script (or a
       // stale draft saved before this fix) could have populated with unsanitized HTML — sanitize
       // before it re-enters the live document.
@@ -771,6 +855,10 @@
     document.addEventListener('input', onEditableInput, true);
     document.addEventListener('paste', onEditablePaste, true);
     document.addEventListener('drop', onEditableDrop, true);
+    document.addEventListener('keydown', onEditableKeydown, true);
+    // v0.3.3: catch a resize the instant the drag ends (mouseup), not only at edit-mode exit -- see
+    // the function's own comment for why exitEditMode()-only was too late (blur mid-session).
+    document.addEventListener('mouseup', checkAndPersistAnyResizedWidths, true);
     hideDraftBanner(); // clears any banner-driven padding-top before we set the toolbar's own.
     hideStatusBanner(); // stepA2_deploy_ux: same reason -- a deploy-status/guard banner is also fixed-to-top.
     measureAndSetToolbarPadding();
@@ -780,12 +868,49 @@
     document.removeEventListener('input', onEditableInput, true);
     document.removeEventListener('paste', onEditablePaste, true);
     document.removeEventListener('drop', onEditableDrop, true);
+    document.removeEventListener('keydown', onEditableKeydown, true);
+    document.removeEventListener('mouseup', checkAndPersistAnyResizedWidths, true);
     window.removeEventListener('resize', measureAndSetToolbarPadding);
     document.body.style.paddingTop = ''; // C2: drop the inline override so it can't outlive edit mode.
     clearTimeout(draftTimer);
     editableEls.forEach(function(el){
       el.removeAttribute('contenteditable');
       el.removeAttribute('data-wz-editable');
+      // v0.3.2 (design pivot): resize/overflow themselves are pure :focus-scoped CSS (never written
+      // inline -- see the CSS comment above) and always disappear the instant [data-wz-editable] is
+      // removed, so there is nothing to clean up for those two. width/height are different: dragging
+      // the native resize handle makes the BROWSER itself write explicit width/height onto the
+      // element's inline style, and per Master's real-usage correction, a WIDTH change the user
+      // actually made is the point of the feature and must survive -- not be wiped on exit.
+      // v0.3.4: persistResizedWidthIfChanged() is the SAME function the mouseup handler below already
+      // calls the instant a drag ends -- calling it again here is a defensive backstop (in case
+      // mouseup was somehow missed), not a second, divergent implementation. Sharing one function is
+      // itself the v0.3.4 fix for the v0.3.2/v0.3.3 divergence bug (exit-only vs mouseup-only logic
+      // drifting apart across two hand-written copies).
+      var origSize = origSizeMap.get(el) || {width: '', height: ''};
+      var widthWasResized = persistResizedWidthIfChanged(el, origSize);
+      // v0.3.5(B) (Master real-usage correction, 2026-08-31): a content-edited (not resized) element
+      // ALSO needs max-width:100% persisted -- but that is applied directly to the live `el` inside
+      // buildEditedSource() (see its own v0.3.5(B) comment), NOT re-detected here. A same-index
+      // re-check of origInnerMap at this point would be WRONG: doSave()'s success path calls
+      // collectEditables() (which resets origInnerMap to the just-saved content) BEFORE calling
+      // exitEditMode(), so "did content change" always reads false here -- found via live-doc
+      // testing (the saved file was already correct; only this live-tab detection was silently
+      // dead). The plain restore branch below is safe regardless: it only ever touches width/height,
+      // never max-width, so it can't undo what buildEditedSource() already set.
+      if (widthWasResized) {
+        // Height is dropped: it was never the intent, and content-driven height is more natural once
+        // this is no longer an active resize target.
+        el.style.removeProperty('height');
+      } else {
+        // Not resized this session -- restore exactly what was there before (may be '', may be a
+        // legitimate pre-existing author width/height) so nothing is altered for an element the user
+        // never dragged. (A content-only edit's max-width:100% was already applied above/earlier and
+        // is untouched by this, since only width/height are reset here.)
+        el.style.width = origSize.width;
+        el.style.height = origSize.height;
+      }
+      origSizeMap.delete(el);
     });
     document.body.classList.remove('wz-edit-mode');
     if (commitMsgInput) commitMsgInput.value = ''; // P3-4: don't carry a stale memo into the next edit session.
@@ -818,6 +943,120 @@
     if (!host) return;
     e.preventDefault();
     insertSanitizedHtmlOrText(host, e.dataTransfer);
+  }
+  // v0.3.2 (real-doc incident, 2026-08-31): a bare Enter (or Shift+Enter) inside a contenteditable
+  // region defaults to the BROWSER's own block-splitting behavior -- confirmed against the real czn
+  // document, where a single Enter turned one <p class="para"> into <p>+<div>+empty<p>, losing the
+  // class entirely. The host block element's tag/class/count must never change from a keystroke, so
+  // Enter is intercepted here and replaced with a plain line break (<br>) instead of the browser's
+  // default paragraph-split. 'insertLineBreak' (not 'insertParagraph', which IS the block-splitting
+  // command) is used via execCommand for the same reason execAlignOrBold()/
+  // insertSanitizedHtmlOrText() above already do -- consistent with this module's existing
+  // convention, and reliably implemented in Chromium (this module's deployment target).
+  function onEditableKeydown(e){
+    if (e.key !== 'Enter') return;
+    var host = e.target && e.target.closest ? e.target.closest('[data-wz-editable="true"]') : null;
+    if (!host) return;
+    e.preventDefault();
+    document.execCommand('insertLineBreak');
+    notifyChanged(host); // execCommand does not reliably fire 'input' on its own -- see execAlignOrBold's identical pattern.
+  }
+  // v0.3.3 (real-doc incident, 2026-08-31): v0.3.2 only applied the persisted `max-width:100%`
+  // override in exitEditMode() -- but that meant the FIRST time an element blurred (moving focus to
+  // a different paragraph, WITHOUT ending the edit session), the :focus-scoped `max-width:none
+  // !important` CSS rule stopped matching immediately, and the document's own `max-width:76ch` (or
+  // similar) snapped straight back in, undoing the resize instantly and long before exitEditMode()
+  // ever ran. Fix: apply the SAME persistence (inline max-width:100%, which beats any non-!important
+  // stylesheet rule regardless of specificity) the moment a resize is detected, not at session end.
+  // Detection is a plain mouseup-time snapshot comparison (native CSS resize is a mouse-drag
+  // interaction; mouseup is the natural "the drag just ended" signal) -- checked against ALL
+  // editableEls rather than closest(e.target) alone, since the browser's own pointer-capture
+  // behavior during a resize drag can vary and this is a cheap, purely defensive per-element string
+  // compare either way. An element that was never resized is left completely untouched.
+  function checkAndPersistAnyResizedWidths(){
+    editableEls.forEach(function(el){
+      var origSize = origSizeMap.get(el);
+      if (origSize) persistResizedWidthIfChanged(el, origSize);
+    });
+  }
+  // v0.3.4 (Master real-doc policy, 2026-08-31): building block indices (root's child, that child's
+  // child, ...) from `root` down to `node` -- used to re-locate the SAME structural ancestor across
+  // two independently-produced DOM trees of the same page (the live document here; the
+  // freshly-re-fetched-and-DOMParser-reparsed remote document in buildEditedSource). This generalizes
+  // the exact positional-matching principle editableEls<->origCandidates already relies on elsewhere
+  // in this file (a flat array index there; a tree-of-indices path here, since a container ancestor,
+  // unlike a tracked editable leaf, has no array slot of its own to look up by).
+  function elementChildPath(root, node){
+    var path = [];
+    var cur = node;
+    while (cur && cur !== root){
+      var parent = cur.parentElement;
+      if (!parent) return null;
+      var idx = Array.prototype.indexOf.call(parent.children, cur);
+      if (idx === -1) return null;
+      path.unshift(idx);
+      cur = parent;
+    }
+    return cur === root ? path : null;
+  }
+  function resolveElementChildPath(root, path){
+    var cur = root;
+    for (var i = 0; i < path.length && cur; i++){ cur = cur.children[path[i]]; }
+    return cur || null;
+  }
+  // v0.3.4 (Master real-doc policy, 2026-08-31): Master's explicit product decision from a live
+  // measurement against the real czn document -- dragging a paragraph to 1258px only to have
+  // max-width:100% clamp it back down to its container's own 1004px content width (the container
+  // itself never grew) reads to a user as "it reverted", not "it's responsive". Policy: when a
+  // resize target genuinely cannot fit inside its current containing block, the CONTAINING BLOCK
+  // grows to fit it -- computed generically (walk every ancestor up to <body>, check each one's own
+  // computed max-width against what's actually needed given its box-sizing/padding/border), never
+  // hardcoded to any one class name/selector, so this works on any host document, not just czn's.
+  // max-width:100% on the element itself is untouched/still active -- a genuinely narrow VIEWPORT
+  // still shrinks it (requirement #2's responsive safety net survives; only an artificially-small
+  // fixed container gets raised).
+  function elevateConstrainingAncestors(el, targetWidthPx){
+    var node = el.parentElement;
+    while (node && node !== document.body && node.nodeType === 1){
+      var cs = getComputedStyle(node);
+      var computedMaxWidth = parseFloat(cs.maxWidth);
+      if (cs.maxWidth !== 'none' && !isNaN(computedMaxWidth)){
+        var padL = parseFloat(cs.paddingLeft) || 0;
+        var padR = parseFloat(cs.paddingRight) || 0;
+        var bL = parseFloat(cs.borderLeftWidth) || 0;
+        var bR = parseFloat(cs.borderRightWidth) || 0;
+        // border-box: max-width bounds the TOTAL box (content+padding+border), so the content area
+        // available to children is (max-width - padding - border) -- to fit targetWidthPx of content,
+        // max-width must be raised by that same padding+border amount. content-box: max-width already
+        // bounds the content area directly, so targetWidthPx alone is the needed value.
+        var needed = (cs.boxSizing === 'border-box') ? (targetWidthPx + padL + padR + bL + bR) : targetWidthPx;
+        if (computedMaxWidth < needed - 0.5){ // 0.5px epsilon for subpixel rounding
+          node.style.maxWidth = needed + 'px';
+          elevatedAncestorEls.add(node);
+        }
+      }
+      node = node.parentElement;
+    }
+  }
+  // v0.3.4: single shared implementation for "a resize was detected -> persist it" -- called both
+  // immediately on mouseup (below) and defensively in exitEditMode() above, so the two call sites can
+  // never again diverge into two hand-written copies (exactly what caused the v0.3.2->v0.3.3 gap).
+  // Returns whether this element was actually resized this session (callers use this to decide
+  // whether to also drop height / skip the restore branch).
+  function persistResizedWidthIfChanged(el, origSize){
+    if (el.style.width === origSize.width) return false; // untouched this session -- never modified
+    if (el.style.maxWidth !== '100%') el.style.maxWidth = '100%';
+    var targetWidthPx = parseFloat(el.style.width);
+    if (!isNaN(targetWidthPx)){
+      // Requirement #2: only escalate to the ancestor chain when the container is ACTUALLY capping
+      // the element below its own target width right now -- never speculatively raise an ancestor
+      // that was never actually a problem.
+      var renderedWidth = el.getBoundingClientRect().width;
+      if (renderedWidth < targetWidthPx - 0.5){
+        elevateConstrainingAncestors(el, targetWidthPx);
+      }
+    }
+    return true;
   }
   editFab.addEventListener('click', function(){ requireAuth(evaluateReentryGuardAndProceed); });
 
@@ -898,13 +1137,61 @@
     if (fmtSizeSelect.value) applyInlineStyle('fontSize', fmtSizeSelect.value + 'px');
     fmtSizeSelect.value = '';
   });
+  // v0.3 feature 2: recent-colors -- MRU list of applied text colors, persisted so it survives
+  // across page reloads/edit sessions (not just within one). Kept intentionally simple (dedupe by
+  // exact string match, no color-space normalization) since the values recorded here are always
+  // either a `#rrggbb` from the <input type=color> picker or one of this toolbar's own fixed
+  // `var(--...)` preset strings -- both compare correctly with a plain string check.
+  var RECENT_COLORS_KEY = 'wz-recent-colors';
+  var RECENT_COLORS_MAX = 8;
+  var recentColorsEl = document.getElementById('wzFmtRecentColors');
+  function getRecentColors(){
+    try {
+      var raw = localStorage.getItem(RECENT_COLORS_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.filter(function(c){ return typeof c === 'string' && c; }) : [];
+    } catch (e) { return []; } // corrupt/unparseable value -- treat as empty rather than throwing
+  }
+  function renderRecentColorSwatches(){
+    if (!recentColorsEl) return;
+    recentColorsEl.innerHTML = '';
+    getRecentColors().forEach(function(c){
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'wz-fmt-recent-swatch';
+      btn.style.background = c;
+      btn.title = c;
+      btn.setAttribute('aria-label', '최근 색상 ' + c + ' 적용');
+      preserveSelectionOnMousedown(btn);
+      btn.addEventListener('click', function(){ applyInlineStyle('color', c); recordRecentColor(c); });
+      recentColorsEl.appendChild(btn);
+    });
+  }
+  // Recorded on every successful color application (free picker + fixed preset swatches alike) --
+  // moves an already-present color to the front (MRU) instead of duplicating it, and caps the list
+  // at RECENT_COLORS_MAX (drops the oldest/least-recently-used entry once full).
+  function recordRecentColor(color){
+    if (!color) return;
+    var list = getRecentColors().filter(function(c){ return c !== color; });
+    list.unshift(color);
+    if (list.length > RECENT_COLORS_MAX) list = list.slice(0, RECENT_COLORS_MAX);
+    try { localStorage.setItem(RECENT_COLORS_KEY, JSON.stringify(list)); }
+    catch (e) { /* quota/private-mode -- non-critical, recent colors just won't persist this time */ }
+    renderRecentColorSwatches();
+  }
+  renderRecentColorSwatches(); // restore saved recent colors at editor-attach time (spec: "편집 세션 시작 시 복원")
+
   var fmtColorPicker = document.getElementById('wzFmtColorPicker');
-  fmtColorPicker.addEventListener('input', function(){ applyInlineStyle('color', fmtColorPicker.value); });
+  fmtColorPicker.addEventListener('input', function(){
+    applyInlineStyle('color', fmtColorPicker.value);
+    recordRecentColor(fmtColorPicker.value);
+  });
   Array.prototype.forEach.call(document.querySelectorAll('.wz-fmt-color-btn'), function(btn){
     preserveSelectionOnMousedown(btn);
     btn.addEventListener('click', function(){
       var c = btn.getAttribute('data-color');
       applyInlineStyle('color', c || 'inherit');
+      if (c) recordRecentColor(c); // the "기본(검정)" button passes '' (inherit) -- not a color worth recalling
     });
   });
   Array.prototype.forEach.call(document.querySelectorAll('.wz-fmt-btn[data-align]'), function(btn){
@@ -1299,7 +1586,14 @@
     var handlerLeakFound = false;
     editableEls.forEach(function(el, idx){
       var orig = origInnerMap.get(idx), now = el.innerHTML;
-      if (orig === now) return;
+      var contentChanged = (orig !== now);
+      // v0.3.2: a deliberate width resize is now ALSO a real, committable change -- not just a
+      // live-DOM-only effect -- so it must be detected here the same way exitEditMode() detects it
+      // (compare current el.style.width against the enterEditMode() snapshot), independently of
+      // whether the element's text content changed at all.
+      var origSize = origSizeMap.get(el) || {width: '', height: ''};
+      var widthWasResized = el.style.width !== origSize.width;
+      if (!contentChanged && !widthWasResized) return; // nothing to commit for this element
       touchedCount++;
       var target = structuralDrift ? null : origCandidates[idx];
       if (!target){ mismatchCount++; return; }
@@ -1310,19 +1604,63 @@
       // baseline at this index still matches what our local session started from. If it doesn't,
       // this slot was touched by something outside this editing session (a reorder, or someone
       // else's commit) since we captured origInnerMap -- abort this index as a mismatch rather than
-      // blindly overwriting whatever now sits at that position.
+      // blindly overwriting whatever now sits at that position. Applies to a resize-only change too:
+      // writing a new width onto a slot that has drifted underneath us is exactly as unsafe as
+      // writing new content onto one.
       if (target.innerHTML !== orig){ mismatchCount++; return; }
-      // F-2 sink 3: defense in depth. Paste/drop and draft-restore are already sanitized at their
-      // own sinks, but this is the last point before the edited HTML is written into the document
-      // that gets committed — sanitize here too so no future or overlooked input path can slip
-      // executable markup into the saved file.
-      target.innerHTML = sanitizeHtmlFragment(now);
-      // Assert the sanitize actually held, scoped to just this edited element — NOT the whole
-      // document, because the whole document legitimately contains wz-editor's own
-      // <script src="...wz-editor.js"> embed tag (and possibly other host-page scripts
-      // unrelated to this feature), which would otherwise false-positive on every real save.
-      if (target.querySelector(WZ_LEAK_SCAN_SEL) || wzTargetHasDangerousUrl(target)) handlerLeakFound = true;
+      if (contentChanged){
+        // F-2 sink 3: defense in depth. Paste/drop and draft-restore are already sanitized at their
+        // own sinks, but this is the last point before the edited HTML is written into the document
+        // that gets committed — sanitize here too so no future or overlooked input path can slip
+        // executable markup into the saved file.
+        target.innerHTML = sanitizeHtmlFragment(now);
+        // Assert the sanitize actually held, scoped to just this edited element — NOT the whole
+        // document, because the whole document legitimately contains wz-editor's own
+        // <script src="...wz-editor.js"> embed tag (and possibly other host-page scripts
+        // unrelated to this feature), which would otherwise false-positive on every real save.
+        if (target.querySelector(WZ_LEAK_SCAN_SEL) || wzTargetHasDangerousUrl(target)) handlerLeakFound = true;
+        // v0.3.5(B) (Master real-usage correction, 2026-08-31): "보이는 것 = 저장되는 것" -- any
+        // element whose CONTENT was actually edited was ALSO visually seen at its unclamped
+        // focus-mode width (the :focus rule's max-width:none preview) the whole time it was being
+        // edited. Persist that appearance via max-width:100% -- never an explicit width (stays
+        // container/viewport-responsive; a normal block element already defaults to filling its
+        // containing block, which is exactly what the focus-mode preview was already showing).
+        // Applied to BOTH the commit target AND the live `el` right here -- NOT re-detected later in
+        // exitEditMode(), because doSave()'s success path calls collectEditables() (which resets
+        // origInnerMap to the just-saved content) BEFORE calling exitEditMode(), so a second
+        // "did content change" check performed there would always see "no change" and silently never
+        // fire (found via live-doc testing: the saved file was correct but the live tab still
+        // snapped back). This is this function's own C1-adjacent timing hazard -- buildEditedSource()
+        // runs before that re-baseline, so it is the only correct place to also touch the live DOM.
+        target.style.maxWidth = '100%';
+        el.style.maxWidth = '100%';
+      }
+      if (widthWasResized){
+        // Mirrors the exitEditMode() persistence branch exactly, applied to the freshly-parsed
+        // commit-target element instead of the live one. No sanitization needed here (unlike
+        // innerHTML): assigning to .style.width/.maxWidth only ever accepts a valid CSS length via
+        // the CSSOM setter -- there is no markup-injection surface through a style property value.
+        target.style.width = el.style.width;
+        target.style.maxWidth = '100%';
+      }
       changedCount++;
+    });
+    // v0.3.4 (Master real-doc policy, 2026-08-31): replicate any ancestor max-width elevation
+    // (elevateConstrainingAncestors, triggered above via persistResizedWidthIfChanged callers) into
+    // the commit target too -- otherwise the container grows in THIS tab only, and the very next
+    // page load (a fresh DOM, none of this session's live elevation) clamps right back down.
+    // Ancestors aren't tracked editable leaves with an array index of their own (editableEls<->
+    // origCandidates), so they're re-located by child-index PATH from <body> instead -- the same
+    // "same document, two independently-produced trees" matching problem, generalized. A resolved
+    // node whose tag doesn't match the live one is treated as drift (someone/something restructured
+    // that part of the document since this session started) and is skipped rather than blindly
+    // written to, mirroring the C4 mismatch-safety principle above.
+    elevatedAncestorEls.forEach(function(liveAncestor){
+      var path = elementChildPath(document.body, liveAncestor);
+      if (!path) return;
+      var targetAncestor = resolveElementChildPath(doc.body, path);
+      if (!targetAncestor || targetAncestor.tagName !== liveAncestor.tagName) return;
+      targetAncestor.style.maxWidth = liveAncestor.style.maxWidth;
     });
     var leaked = [];
     if (doc.querySelector('[contenteditable]')) leaked.push('contenteditable');
